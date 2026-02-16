@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./cuda/build/**)",
+      "Read(./**/__pycache__/**)",
+      "Read(./**/*.pyc)",
+      "Read(./**/*.pyo)",
+      "Read(./**/*.so)",
+      "Read(./**/*.o)",
+      "Read(./**/*.cubin)",
+      "Read(./**/*.ptx)"
+    ]
+  },
+  "respectGitignore": true
+}

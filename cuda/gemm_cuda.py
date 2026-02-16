@@ -45,10 +45,12 @@ gemm_cuda_compiled = load(
 
 ALGO_MAP = {
     "naive": 0,
-    "wmma_simple": 1,
-    "wmma_smem": 2,
-    "wmma_smem_vec": 3,
-    "wmma_smem_vec_2D": 4,
+    "smem": 1,
+    "smem_2D": 2,
+    "wmma_simple": 3,
+    "wmma_smem": 4,
+    "wmma_smem_vec": 5,
+    "wmma_smem_vec_2D": 6,
 }
 
 def gemm_cuda_func(
@@ -62,7 +64,7 @@ def gemm_cuda_func(
     Args:
         matA: Input matrix A of shape (M, K), dtype fp16
         matB: Input matrix B of shape (N, K), dtype fp16 (will be transposed)
-        algo: Algorithm selection - "naive", "wmma_simple", "wmma_smem",
+        algo: Algorithm selection - "naive", "smem", "wmma_simple", "wmma_smem",
               "wmma_smem_vec", "wmma_smem_vec_2D"
 
     Returns:

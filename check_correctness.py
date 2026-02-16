@@ -13,7 +13,7 @@ c_test = torch.matmul(matA, matB.T)
 abs_tol = 1e-2
 rel_tol = 1e-2
 
-algos = ["naive", "wmma_simple", "wmma_smem", "wmma_smem_vec", "wmma_smem_vec_2D"]
+algos = ["naive", "smem", "smem_2D", "wmma_simple", "wmma_smem", "wmma_smem_vec", "wmma_smem_vec_2D"]
 
 for algo in algos:
     output = gemm_cuda_func(matA, matB, algo)
