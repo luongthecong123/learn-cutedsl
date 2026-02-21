@@ -12,7 +12,7 @@ def naive_smem_launcher(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
     
     naive_smem_kernel(mA, mB, mC, M, N, K).launch(
         grid=[N // BN, M // BM, 1],
-        block=[16, 16, 1])
+        block=[BM, BN, 1])
 
 @cute.kernel
 def naive_smem_kernel(
