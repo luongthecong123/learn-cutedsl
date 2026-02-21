@@ -8,6 +8,7 @@ def naive_smem_launcher(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
     K = mA.shape[1]
     
     BM, BN, BK = 16, 16, 16
+    assert BM == BN, f"[NAIVE SMEM ab_] BM ({BM}) must equal BN ({BN})"
     
     naive_smem_kernel(mA, mB, mC, M, N, K).launch(
         grid=[N // BN, M // BM, 1],
@@ -44,21 +45,8 @@ def naive_smem_kernel(
         for i in range(tid, num_loads, num_threads):
             row = i // BK
             col = i % BK
-            gRow = bidy * BM + row
-            gCol = ctak + col
-
-            if gRow < M and gCol < K:
-                sA[row, col] = gA[gRow, gCol]
-
-        num_loads = BN * BK
-        for i in range(tid, num_loads, num_threads):
-            row = i // BK
-            col = i % BK
-            gRow = bidx * BN + row
-            gCol = ctak + col
-
-            if gRow < N and gCol < K:
-                sB[row, col] = gB[gRow, gCol]        
+            sA[row, col] = gA[bidy * BM + row, ctak + col]
+            sB[row, col] = gB[bidx * BN + row, ctak + col]
         
         cute.arch.sync_threads()
         

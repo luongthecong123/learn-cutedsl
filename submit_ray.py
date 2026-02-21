@@ -2,26 +2,22 @@ import torch
 import ray
 import sys
 import time
-# sys.path.insert(0, 'cutedsl')
 
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
-from cutedsl.aa_naive_cuda_like import naive
-from cutedsl.ab_smem_cuda_like import naive_smem_launcher
-from cutedsl.ac_smem_2D_cuda_like import smem_2D_launcher
+# from cutedsl.aa_naive_cuda_like import naive
+# from cutedsl.ab_smem_cuda_like import naive_smem_launcher
+# from cutedsl.ac_smem_2D_cuda_like import smem_2D_launcher
+from cutedsl.cc_wgmma_warp_spec import Gemm_TC
 
 @ray.remote(num_gpus=1)
 class Gemm:
-    def __init__(self, algo_name="naive"):
+    def __init__(self, algo_name="wgmma_warp_spec", cta_tiler=(128, 128, 64)):
         self.algo_name = algo_name
-        self.algos = {
-            "naive": naive,
-            "naive_smem": naive_smem_launcher,
-            "smem_2D": smem_2D_launcher,
-        }
-        self.algo_func = self.algos[algo_name]
+        self.cta_tiler = cta_tiler
+        self.gemm_instance = Gemm_TC(cta_tiler=cta_tiler)
 
-    def run_gemm(self, M=1024, N=1024, K=1024, iterations=10, abs_tol=1e-2, rel_tol=1e-2):
+    def run_gemm(self, M=8192, N=8192, K=8192, iterations=10, abs_tol=1e-1, rel_tol=1e-1):
         device = 'cuda'
 
         a = torch.randn(M, K, device=device, dtype=torch.float16)
@@ -34,7 +30,7 @@ class Gemm:
         c = torch.empty(M, N, device=device, dtype=torch.float16)
         c_ = from_dlpack(c, assumed_align=16)
 
-        compiled_code = cute.compile(self.algo_func, a_, b_, c_)
+        compiled_code = cute.compile(self.gemm_instance, a_, b_, c_)
 
         compiled_code(a_, b_, c_)
         torch.cuda.synchronize()
@@ -51,7 +47,7 @@ class Gemm:
             "device": str(device),
             "cuda_device_name": torch.cuda.get_device_name(0),
             "dtype": "fp16",
-            "algo": self.algo_name,
+            "algo": f"{self.algo_name}_{self.cta_tiler}",
             "matrix_shape": (M, N, K),
             "iterations": iterations,
             "correctness": correctness_status,
@@ -91,17 +87,17 @@ if __name__ == "__main__":
     num_gpus = int(ray.available_resources().get("GPU", 0))
     print(f"Available GPUs: {num_gpus}")
 
-    algos = ["naive", "naive_smem", "smem_2D"]
-    num_workers = min(num_gpus, 1) if num_gpus > 0 else 1
+    # algos = ["naive", "naive_smem", "smem_2D"]
+    cta_tilers = [(128, 128, 64)]
 
-    M, N, K = 1024, 1024, 1024
+    M, N, K = 8192, 8192, 8192
     iterations = 10
-    abs_tol = 1e-2
-    rel_tol = 1e-2
+    abs_tol = 1e-1
+    rel_tol = 1e-1
 
     futures = []
-    for algo in algos:
-        worker = Gemm.remote(algo_name=algo)
+    for cta_tiler in cta_tilers:
+        worker = Gemm.remote(algo_name="wgmma_warp_spec", cta_tiler=cta_tiler)
         future = worker.run_gemm.remote(M=M, N=N, K=K, iterations=iterations, abs_tol=abs_tol, rel_tol=rel_tol)
         futures.append(future)
 
