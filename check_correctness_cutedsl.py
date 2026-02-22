@@ -3,9 +3,9 @@ import sys
 sys.path.insert(0, 'cutedsl')
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
-from aa_naive_cuda_like import naive
-from ab_smem_cuda_like import naive_smem_launcher
-from ac_smem_2D_cuda_like import smem_2D_launcher
+from a1_naive_cuda_like import naive
+from a2_smem_cuda_like import naive_smem_launcher
+from a3_smem_2D_cuda_like import smem_2D_launcher
 
 M, K, N = 1024, 1024, 1024
 device = 'cuda'

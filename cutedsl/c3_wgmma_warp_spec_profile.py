@@ -10,21 +10,21 @@ import cutlass.utils.hopper_helpers as sm90_utils
 import cutlass.utils as utils
 from cutlass.cutlass_dsl import dsl_user_op, T
 from cutlass._mlir.dialects import llvm
-
+from cutlass.cute.testing import benchmark, JitArguments
 
 # ── Profiler constants ──────────────────────────────────────────────
-PROFILER_HEADER = 1
-PROFILER_ENTRY  = 4
+PROBE_HEADER = 1
+PROBE_ENTRY  = 4
 
-NUM_PROF_ROLES = 2
+NUM_PROBE_ROLES = 2
 TMA_ROLE = 0
 MMA_ROLE = 1
 ROLE_NAMES = {TMA_ROLE: "TMA", MMA_ROLE: "MMA"}
 
 TAGS = {
     "tma_load":     0,
-    "wgmma":        2,
-    "tma_store":    4,
+    "wgmma":         2,
+    "tma_store":     4,
     "frag_to_smem": 6,
 }
 TAG_NAMES = {v: k for k, v in TAGS.items()}
@@ -61,55 +61,55 @@ def smid_u32(*, loc=None, ip=None) -> cutlass.Int32:
     return cutlass.Int32(t)
 
 
-@dsl_user_op
-def cp_async_bulk_wait_group_read_0(*, loc=None, ip=None) -> cutlass.Int32:
-    t = llvm.inline_asm(
-        T.i32(), [],
-        "cp.async.bulk.wait_group.read 0;\n\tmov.u32 $0, 0;",
-        "=r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc, ip=ip,
-    )
-    return cutlass.Int32(t)
+# @dsl_user_op
+# def cp_async_bulk_wait_group_read_0(*, loc=None, ip=None) -> cutlass.Int32:
+#     t = llvm.inline_asm(
+#         T.i32(), [],
+#         "cp.async.bulk.wait_group.read 0;\n\tmov.u32 $0, 0;",
+#         "=r",
+#         has_side_effects=True,
+#         is_align_stack=False,
+#         asm_dialect=llvm.AsmDialect.AD_ATT,
+#         loc=loc, ip=ip,
+#     )
+#     return cutlass.Int32(t)
 
 
 # ── Profiler helpers (used inside kernel) ───────────────────────────
 
-def prof_start(prof, row, cnt, sm_val, tag_val):
-    off = PROFILER_HEADER + cnt * PROFILER_ENTRY
-    prof[row, off + 0] = cutlass.Int64(sm_val)
-    prof[row, off + 1] = cutlass.Int64(tag_val)
-    prof[row, off + 2] = globaltimer_u64()
+def range_start(probe, row, cnt, sm_val, tag_val):
+    off = PROBE_HEADER + cnt * PROBE_ENTRY
+    probe[row, off + 0] = cutlass.Int64(sm_val)
+    probe[row, off + 1] = cutlass.Int64(tag_val)
+    probe[row, off + 2] = globaltimer_u64()
 
 
-def prof_stop(prof, row, cnt):
-    off = PROFILER_HEADER + cnt * PROFILER_ENTRY
-    prof[row, off + 3] = globaltimer_u64() - prof[row, off + 2]
+def range_stop(probe, row, cnt):
+    off = PROBE_HEADER + cnt * PROBE_ENTRY
+    probe[row, off + 3] = globaltimer_u64() - probe[row, off + 2]
     return cnt + cutlass.Int32(1)
 
 
-def prof_finalize(prof, row, cnt):
-    prof[row, 0] = cutlass.Int64(cnt)
+def range_finalize(probe, row, cnt):
+    probe[row, 0] = cutlass.Int64(cnt)
 
 
 # ── Host-side profiler analysis and trace output ────────────────────
 
-def dump_profiler(profiler: torch.Tensor, num_blocks: int,
+def dump_probe(probe: torch.Tensor, num_blocks: int,
                   out_path: str = "cute_warp_spec_trace.json"):
-    prof_cpu = profiler.cpu().contiguous().tolist()
-    total_rows = num_blocks * NUM_PROF_ROLES
+    probe_cpu = probe.cpu().contiguous().tolist()
+    total_rows = num_blocks * NUM_PROBE_ROLES
 
     # ── Per-block detail ──
     for bid in range(min(num_blocks, 4)):
-        for role in range(NUM_PROF_ROLES):
-            row_idx = bid * NUM_PROF_ROLES + role
-            data = prof_cpu[row_idx]
+        for role in range(NUM_PROBE_ROLES):
+            row_idx = bid * NUM_PROBE_ROLES + role
+            data = probe_cpu[row_idx]
             cnt = int(data[0])
             print(f"\n--- Block {bid}, {ROLE_NAMES[role]} warp: {cnt} entries ---")
             for i in range(cnt):
-                off = PROFILER_HEADER + i * PROFILER_ENTRY
+                off = PROBE_HEADER + i * PROBE_ENTRY
                 sm_id, tag = int(data[off]), int(data[off + 1])
                 start, dur = int(data[off + 2]), int(data[off + 3])
                 print(f"  sm={sm_id} {TAG_NAMES.get(tag, f'tag_{tag}'):20s} "
@@ -118,24 +118,24 @@ def dump_profiler(profiler: torch.Tensor, num_blocks: int,
     # ── Chrome trace JSON ──
     events, global_base, sm_seen = [], None, set()
     for row_idx in range(total_rows):
-        for i in range(int(prof_cpu[row_idx][0])):
-            s = int(prof_cpu[row_idx][PROFILER_HEADER + i * PROFILER_ENTRY + 2])
+        for i in range(int(probe_cpu[row_idx][0])):
+            s = int(probe_cpu[row_idx][PROBE_HEADER + i * PROBE_ENTRY + 2])
             if s > 0 and (global_base is None or s < global_base):
                 global_base = s
     global_base = global_base or 0
 
     for row_idx in range(total_rows):
-        data = prof_cpu[row_idx]
+        data = probe_cpu[row_idx]
         cnt = int(data[0])
         if cnt == 0:
             continue
-        sm_id = int(data[PROFILER_HEADER])
-        role = row_idx % NUM_PROF_ROLES
+        sm_id = int(data[PROBE_HEADER])
+        role = row_idx % NUM_PROBE_ROLES
         if (sm_id, role) in sm_seen:
             continue
         sm_seen.add((sm_id, role))
         for i in range(cnt):
-            off = PROFILER_HEADER + i * PROFILER_ENTRY
+            off = PROBE_HEADER + i * PROBE_ENTRY
             tag, start, dur = int(data[off+1]), int(data[off+2]), int(data[off+3])
             if start == 0 and dur == 0:
                 continue
@@ -207,7 +207,7 @@ class Gemm_TC:
         a: cute.Tensor,
         b: cute.Tensor,
         c: cute.Tensor,
-        profiler: cute.Tensor,
+        probe: cute.Tensor,
         use_measure: cutlass.Constexpr,
     ):
         self.a_dtype = a.element_type
@@ -297,7 +297,7 @@ class Gemm_TC:
             c,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
-            profiler,
+            probe,
             use_measure,
         ).launch(
             grid=grid_dim,
@@ -318,7 +318,7 @@ class Gemm_TC:
         mC: cute.Tensor,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
-        profiler: cute.Tensor,
+        probe: cute.Tensor,
         use_measure: cutlass.Constexpr,
     ):
         warp_idx = cute.arch.warp_idx()
@@ -341,8 +341,8 @@ class Gemm_TC:
         bid = bidy * grid_x + bidx
         sm = smid_u32()
 
-        tma_row = bid * NUM_PROF_ROLES + TMA_ROLE
-        mma_row = bid * NUM_PROF_ROLES + MMA_ROLE
+        tma_row = bid * NUM_PROBE_ROLES + TMA_ROLE
+        mma_row = bid * NUM_PROBE_ROLES + MMA_ROLE
         tma_cnt = cutlass.Int32(0)
         mma_cnt = cutlass.Int32(0)
 
@@ -453,8 +453,7 @@ class Gemm_TC:
                     cute.arch.mbarrier_arrive(mbar_ptr)
 
                     if cutlass.const_expr(use_measure):
-                        prof_start(profiler, tma_row, tma_cnt, sm,
-                                   TAGS["tma_load"])
+                        range_start(probe, tma_row, tma_cnt, sm, TAGS["tma_load"])
 
                 cute.copy(
                     tma_atom_a, tAgA[None, kidx], tAsA[None, 0],
@@ -470,14 +469,13 @@ class Gemm_TC:
             if is_tma_warp:
                 if tidx == tma_leader:
                     if cutlass.const_expr(use_measure):
-                        tma_cnt = prof_stop(profiler, tma_row, tma_cnt)
+                        tma_cnt = range_stop(probe, tma_row, tma_cnt)
 
             # ── WGMMA COMPUTE ──
             if is_mma_warp:
                 if cutlass.const_expr(use_measure):
                     if tidx == 0:
-                        prof_start(profiler, mma_row, mma_cnt, sm,
-                                   TAGS["wgmma"])
+                        range_start(probe, mma_row, mma_cnt, sm, TAGS["wgmma"])
 
                 cute.nvgpu.warpgroup.fence()
 
@@ -490,16 +488,14 @@ class Gemm_TC:
                         tCrB[k_block_coord],
                         accumulators,
                     )
-                    tiled_mma.set(
-                        cute.nvgpu.warpgroup.Field.ACCUMULATE, True
-                    )
+                    tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
 
                 cute.nvgpu.warpgroup.commit_group()
                 cute.nvgpu.warpgroup.wait_group(0)
 
                 if cutlass.const_expr(use_measure):
                     if tidx == 0:
-                        mma_cnt = prof_stop(profiler, mma_row, mma_cnt)
+                        mma_cnt = range_stop(probe, mma_row, mma_cnt)
 
         # ════════════════════════════════════════════════════════
         # EPILOGUE: accumulators → shared memory
@@ -507,8 +503,7 @@ class Gemm_TC:
         if is_mma_warp:
             if cutlass.const_expr(use_measure):
                 if tidx == 0:
-                    prof_start(profiler, mma_row, mma_cnt, sm,
-                               TAGS["frag_to_smem"])
+                    range_start(probe, mma_row, mma_cnt, sm, TAGS["frag_to_smem"])
 
             tv_layout_C_tiled = tiled_mma.tv_layout_C_tiled
             for reg_idx in range(cute.size(accumulators)):
@@ -525,7 +520,7 @@ class Gemm_TC:
 
             if cutlass.const_expr(use_measure):
                 if tidx == 0:
-                    mma_cnt = prof_stop(profiler, mma_row, mma_cnt)
+                    mma_cnt = range_stop(probe, mma_row, mma_cnt)
 
         cute.arch.sync_threads()
         cute.arch.fence_proxy("async.shared", space="cta")
@@ -546,22 +541,22 @@ class Gemm_TC:
         if is_tma_warp:
             if cutlass.const_expr(use_measure):
                 if tidx == tma_leader:
-                    prof_start(profiler, tma_row, tma_cnt, sm,
+                    range_start(probe, tma_row, tma_cnt, sm,
                                TAGS["tma_store"])
 
             cute.copy(tma_atom_c, tCsC, tCgC_store)
-            _dummy = cp_async_bulk_wait_group_read_0()
+            # _ = cp_async_bulk_wait_group_read_0()
 
             if cutlass.const_expr(use_measure):
                 if tidx == tma_leader:
-                    tma_cnt = prof_stop(profiler, tma_row, tma_cnt)
+                    tma_cnt = range_stop(probe, tma_row, tma_cnt)
 
         # ── Finalize profiler ──
         if cutlass.const_expr(use_measure):
             if tidx == tma_leader:
-                prof_finalize(profiler, tma_row, tma_cnt)
+                range_finalize(probe, tma_row, tma_cnt)
             if tidx == 0:
-                prof_finalize(profiler, mma_row, mma_cnt)
+                range_finalize(probe, mma_row, mma_cnt)
 
 
 # ── Main ────────────────────────────────────────────────────────────
@@ -575,64 +570,29 @@ def main():
     B = torch.randn((N, K), device="cuda", dtype=torch.float16)
     C = torch.empty((M, N), device="cuda", dtype=torch.float16)
 
+    # Initialize Probe
     num_blocks = (N // bN) * (M // bM)
-    k_tile_cnt = K // bK
+    max_entries_per_role = (K // bK) + 1
+    probe_cols = PROBE_HEADER + max_entries_per_role * PROBE_ENTRY
+    probe = torch.zeros((num_blocks * NUM_PROBE_ROLES, probe_cols), device="cuda", dtype=torch.int64)
 
-    # Each role: up to k_tile_cnt loads/computes + 1 store/frag_to_smem
-    max_entries_per_role = k_tile_cnt + 1
-    profiler_cols = PROFILER_HEADER + max_entries_per_role * PROFILER_ENTRY
-    total_rows = num_blocks * NUM_PROF_ROLES
-    profiler = torch.zeros(
-        (total_rows, profiler_cols), device="cuda", dtype=torch.int64
-    )
-
-    A_ = from_dlpack(A, assumed_align=16)
-    B_ = from_dlpack(B, assumed_align=16)
-    C_ = from_dlpack(C, assumed_align=16)
-    profiler_ = from_dlpack(profiler, assumed_align=16)
-
+    A_, B_, C_, probe_ = [from_dlpack(t, assumed_align=16) for t in (A, B, C, probe)]
     gemm = Gemm_TC(cta_tiler=tile_shape)
 
-    # ── Compile both variants ──
-    compiled_measure = cute.compile(gemm, A_, B_, C_, profiler_, True)
-    compiled_clean   = cute.compile(gemm, A_, B_, C_, profiler_, False)
+    compiled_measure = cute.compile(gemm, A_, B_, C_, probe_, True)
+    compiled_clean   = cute.compile(gemm, A_, B_, C_, probe_, False)
 
-    # ── Correctness check (use measured variant) ──
-    compiled_measure(A_, B_, C_, profiler_)
-    torch.cuda.synchronize()
+    compiled_measure(A_, B_, C_, probe_)
+    assert torch.allclose(C, torch.matmul(A, B.T), atol=1e-1, rtol=1e-1), "CORRECTNESS FAILED"
+    print("CORRECTNESS PASS")
 
-    C_ref = torch.matmul(A, B.T)
-    max_diff = (C - C_ref).abs().max().item()
-    print(f"Max abs diff: {max_diff:.6f}")
-    assert torch.allclose(C, C_ref, atol=1e-1, rtol=1e-1), \
-        f"Correctness check FAILED (max diff = {max_diff})"
-    print("Correctness check PASSED")
+    dump_probe(probe, num_blocks)
 
-    # ── Profiled run ──
-    profiler.zero_()
-    compiled_measure(A_, B_, C_, profiler_)
-    torch.cuda.synchronize()
-    dump_profiler(profiler, num_blocks)
-
-    # ── Benchmark both variants ──
-    time_with = cute.testing.benchmark(
-        compiled_measure,
-        kernel_arguments=cute.testing.JitArguments(A_, B_, C_, profiler_),
-    )
-    time_without = cute.testing.benchmark(
-        compiled_clean,
-        kernel_arguments=cute.testing.JitArguments(A_, B_, C_, profiler_),
-    )
-
-    overhead = time_with - time_without
-    overhead_pct = (overhead / time_without) * 100 if time_without > 0 else 0
-
-    print(f"\n{'Variant':<25s} {'Time (µs)':>10s}")
-    print("-" * 37)
-    print(f"{'With profiling':<25s} {time_with:>10.4f}")
-    print(f"{'Without profiling':<25s} {time_without:>10.4f}")
-    print(f"{'Overhead':<25s} {overhead:>10.4f} ({overhead_pct:.1f}%)")
-
+    time = benchmark(compiled_clean, kernel_arguments=JitArguments(A_, B_, C_, probe_))
+    time_probe = benchmark(compiled_measure, kernel_arguments=JitArguments(A_, B_, C_, probe_))
+    
+    print(f"DURATION: {time:>5.4f} µs\nTFLOPS: {(2 * M * N * K) / (time * 1e6):>5.4f}")
+    print(f"DURATION_PROBE: {time_probe:>5.4f} µs\nOVERHEAD: {((time_probe - time) / time) * 100:.2f}%")
 
 if __name__ == "__main__":
     main()

@@ -1,11 +1,11 @@
 #include "cuda_common.cuh"
-#include "kernels/aa_naive.cuh"
-#include "kernels/ab_smem.cuh"
-#include "kernels/ac_smem_2D.cuh"
-#include "kernels/ba_wmma_simple.cuh"
-#include "kernels/bb_wmma_smem.cuh"
-#include "kernels/bc_wmma_smem_vec.cuh"
-#include "kernels/bd_wmma_smem_vec_2D.cuh"
+#include "kernels/a1_naive.cuh"
+#include "kernels/a2_smem.cuh"
+#include "kernels/a3_smem_2D.cuh"
+#include "kernels/b1_wmma_simple.cuh"
+#include "kernels/b2_wmma_smem.cuh"
+#include "kernels/b3_wmma_smem_vec.cuh"
+#include "kernels/b4_wmma_smem_vec_2D.cuh"
 
 
 void gemm_cuda(

@@ -7,6 +7,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 import cutlass.utils.hopper_helpers as sm90_utils
 import cutlass.utils as utils
+from cutlass.cute.testing import benchmark, JitArguments
 
 class Gemm_TC:
     def __init__(
@@ -374,3 +375,26 @@ class Gemm_TC:
             num_multicast=mcast_dim,
         )
         return tma_atom, tma_tensor
+
+def main():
+    M, N, K = 4096, 4096, 4096
+
+    A = torch.randn((M, K), device="cuda", dtype=torch.float16)
+    B = torch.randn((N, K), device="cuda", dtype=torch.float16)
+    C = torch.empty((M, N), device="cuda", dtype=torch.float16)
+
+    A_ = from_dlpack(A, assumed_align=16)
+    B_ = from_dlpack(B, assumed_align=16)
+    C_ = from_dlpack(C, assumed_align=16)
+
+    gemm = Gemm_TC()
+    compiled = cute.compile(gemm, A_, B_, C_)
+    compiled(A_, B_, C_)
+
+    assert torch.allclose(C, torch.matmul(A, B.T), atol=1e-1, rtol=1e-1), f"CORRECTNESS FAILED"
+    print("CORRECTNESS PASS")
+    time = benchmark(compiled, kernel_arguments=JitArguments(A_, B_, C_))
+    print(f"DURATION: {time:>5.4f} µs\nTFLOPS: {(2 * M * N * K) / (time * 1e6):>5.4f}")
+
+if __name__ == "__main__":
+    main()

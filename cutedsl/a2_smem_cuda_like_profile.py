@@ -6,11 +6,11 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import dsl_user_op, T
 from cutlass._mlir.dialects import llvm
-
+from cutlass.cute.testing import benchmark, JitArguments
 
 # ── Profiler constants ──────────────────────────────────────────────
-PROFILER_HEADER = 1
-PROFILER_ENTRY  = 4
+PROBE_HEADER = 1
+PROBE_ENTRY  = 4
 
 TAGS = {
     "gmem_to_smem": 0,
@@ -49,34 +49,34 @@ def smid_u32(*, loc=None, ip=None) -> cutlass.Int32:
 
 
 # ── Profiler helpers ────────────────────────────────────────────────
-def prof_start(prof, row, cnt, sm_val, tag_val):
-    off = PROFILER_HEADER + cnt * PROFILER_ENTRY
-    prof[row, off + 0] = cutlass.Int64(sm_val)
-    prof[row, off + 1] = cutlass.Int64(tag_val)
-    prof[row, off + 2] = globaltimer_u64()
+def range_start(probe, row, cnt, sm_val, tag_val):
+    off = PROBE_HEADER + cnt * PROBE_ENTRY
+    probe[row, off + 0] = cutlass.Int64(sm_val)
+    probe[row, off + 1] = cutlass.Int64(tag_val)
+    probe[row, off + 2] = globaltimer_u64()
 
 
-def prof_stop(prof, row, cnt):
-    off = PROFILER_HEADER + cnt * PROFILER_ENTRY
-    prof[row, off + 3] = globaltimer_u64() - prof[row, off + 2]
+def range_stop(probe, row, cnt):
+    off = PROBE_HEADER + cnt * PROBE_ENTRY
+    probe[row, off + 3] = globaltimer_u64() - probe[row, off + 2]
     return cnt + cutlass.Int32(1)
 
 
-def prof_finalize(prof, row, cnt):
-    prof[row, 0] = cutlass.Int64(cnt)
+def range_finalize(probe, row, cnt):
+    probe[row, 0] = cutlass.Int64(cnt)
 
 
 # ── Trace output ────────────────────────────────────────────────────
 
-def dump_profiler(profiler, num_blocks, out_path="naive_smem_trace.json"):
-    cpu_list = profiler.cpu().contiguous().tolist()
+def dump_probe(probe, num_blocks, out_path="naive_smem_trace.json"):
+    cpu_list = probe.cpu().contiguous().tolist()
 
     # ── Per-block detail ──
     for bid in range(min(num_blocks, 2)):
         cnt = int(cpu_list[bid][0])
         print(f"\n--- Block {bid}: {cnt} entries ---")
         for i in range(cnt):
-            off = PROFILER_HEADER + i * PROFILER_ENTRY
+            off = PROBE_HEADER + i * PROBE_ENTRY
             sm_id, tag = int(cpu_list[bid][off]), int(cpu_list[bid][off + 1])
             start, dur = int(cpu_list[bid][off + 2]), int(cpu_list[bid][off + 3])
             print(f"  sm={sm_id} {TAG_NAMES.get(tag, f'tag_{tag}'):20s} "
@@ -86,7 +86,7 @@ def dump_profiler(profiler, num_blocks, out_path="naive_smem_trace.json"):
     events, global_base, sm_seen = [], None, set()
     for row_idx in range(num_blocks):
         for i in range(int(cpu_list[row_idx][0])):
-            s = int(cpu_list[row_idx][PROFILER_HEADER + i * PROFILER_ENTRY + 2])
+            s = int(cpu_list[row_idx][PROBE_HEADER + i * PROBE_ENTRY + 2])
             if s > 0 and (global_base is None or s < global_base):
                 global_base = s
     global_base = global_base or 0
@@ -96,12 +96,12 @@ def dump_profiler(profiler, num_blocks, out_path="naive_smem_trace.json"):
         cnt = int(data[0])
         if cnt == 0:
             continue
-        sm_id = int(data[PROFILER_HEADER])
+        sm_id = int(data[PROBE_HEADER])
         if sm_id in sm_seen:
             continue
         sm_seen.add(sm_id)
         for i in range(cnt):
-            off = PROFILER_HEADER + i * PROFILER_ENTRY
+            off = PROBE_HEADER + i * PROBE_ENTRY
             tag, start, dur = int(data[off+1]), int(data[off+2]), int(data[off+3])
             if start == 0 and dur == 0:
                 continue
@@ -123,7 +123,7 @@ def naive_smem_launcher(
     mA: cute.Tensor,
     mB: cute.Tensor,
     mC: cute.Tensor,
-    profiler: cute.Tensor,
+    probe: cute.Tensor,
     use_measure: cutlass.Constexpr,
 ):
     M = mA.shape[0]
@@ -133,7 +133,7 @@ def naive_smem_launcher(
     BM, BN, BK = 32, 32, 64
     assert BM == BN
 
-    naive_smem_kernel(mA, mB, mC, M, N, K, profiler, use_measure).launch(
+    naive_smem_kernel(mA, mB, mC, M, N, K, probe, use_measure).launch(
         grid=[N // BN, M // BM, 1],
         block=[BM, BN, 1],
     )
@@ -147,7 +147,7 @@ def naive_smem_kernel(
     M: int,
     N: int,
     K: int,
-    profiler: cute.Tensor,
+    probe: cute.Tensor,
     use_measure: cutlass.Constexpr,
 ):
     BM, BN, BK = 32, 32, 64
@@ -175,7 +175,7 @@ def naive_smem_kernel(
 
     for ctak in range(0, K, BK):
         if cutlass.const_expr(use_measure) and tid == 0:
-            prof_start(profiler, bid, cnt, sm, TAGS["gmem_to_smem"])
+            range_start(probe, bid, cnt, sm, TAGS["gmem_to_smem"])
 
         num_loads = BM * BK
         for i in range(tid, num_loads, num_threads):
@@ -187,8 +187,8 @@ def naive_smem_kernel(
         cute.arch.sync_threads()
 
         if cutlass.const_expr(use_measure) and tid == 0:
-            cnt = prof_stop(profiler, bid, cnt)
-            prof_start(profiler, bid, cnt, sm, TAGS["smem_mma"])
+            cnt = range_stop(probe, bid, cnt)
+            range_start(probe, bid, cnt, sm, TAGS["smem_mma"])
 
         for mmak in range(BK):
             acc += cute.Float32(sA[tidy, mmak]) * cute.Float32(sB[tidx, mmak])
@@ -196,77 +196,48 @@ def naive_smem_kernel(
         cute.arch.sync_threads()
 
         if cutlass.const_expr(use_measure) and tid == 0:
-            cnt = prof_stop(profiler, bid, cnt)
+            cnt = range_stop(probe, bid, cnt)
 
     if cutlass.const_expr(use_measure) and tid == 0:
-        prof_start(profiler, bid, cnt, sm, TAGS["store"])
+        range_start(probe, bid, cnt, sm, TAGS["store"])
 
     gC[bidy * bdimy + tidy, bidx * bdimx + tidx] = cute.Float16(acc)
 
     if cutlass.const_expr(use_measure) and tid == 0:
-        cnt = prof_stop(profiler, bid, cnt)
-        prof_finalize(profiler, bid, cnt)
+        cnt = range_stop(probe, bid, cnt)
+        range_finalize(probe, bid, cnt)
 
 
 # ── Main ────────────────────────────────────────────────────────────
 
 def main():
     M, N, K = 32, 32, 256
+    BM, BN, BK = 32, 32, 64
 
     A = torch.randn((M, K), device="cuda", dtype=torch.float16)
     B = torch.randn((N, K), device="cuda", dtype=torch.float16)
     C = torch.empty((M, N), device="cuda", dtype=torch.float16)
 
-    BM, BN, BK = 32, 32, 64
+    # Initialize Probe
     num_blocks = (N // BN) * (M // BM)
-    k_tile_cnt = K // BK
+    max_entries = (K // BK) * 2 + 1
+    probe = torch.zeros((num_blocks, PROBE_HEADER + max_entries * PROBE_ENTRY), device="cuda", dtype=torch.int64)
+    A_, B_, C_, probe_ = [from_dlpack(t, assumed_align=16) for t in (A, B, C, probe)]
 
-    max_entries = k_tile_cnt * 2 + 1
-    profiler_cols = PROFILER_HEADER + max_entries * PROFILER_ENTRY
-    profiler = torch.zeros((num_blocks, profiler_cols), device="cuda", dtype=torch.int64)
+    compiled_measure = cute.compile(naive_smem_launcher, A_, B_, C_, probe_, True)
+    compiled_clean   = cute.compile(naive_smem_launcher, A_, B_, C_, probe_, False)
 
-    A_ = from_dlpack(A, assumed_align=16)
-    B_ = from_dlpack(B, assumed_align=16)
-    C_ = from_dlpack(C, assumed_align=16)
-    profiler_ = from_dlpack(profiler, assumed_align=16)
+    compiled_measure(A_, B_, C_, probe_)
+    assert torch.allclose(C, torch.matmul(A, B.T), atol=1e-1, rtol=1e-1), "CORRECTNESS FAILED"
+    print("CORRECTNESS PASS")
 
-    # ── Compile both variants ──
-    compiled_measure = cute.compile(naive_smem_launcher, A_, B_, C_, profiler_, True)
-    compiled_clean   = cute.compile(naive_smem_launcher, A_, B_, C_, profiler_, False)
+    dump_probe(probe, num_blocks)
+    
+    time = benchmark(compiled_clean, kernel_arguments=JitArguments(A_, B_, C_, probe_))
+    time_probe = benchmark(compiled_measure, kernel_arguments=JitArguments(A_, B_, C_, probe_))
+    print(f"DURATION: {time:>5.4f} µs\nTFLOPS: {(2 * M * N * K) / (time * 1e6):>5.4f}")
+    print(f"DURATION_PROBE: {time_probe:>5.4f} µs\nOVERHEAD: {((time_probe - time) / time) * 100:.2f}%")
 
-    # ── Correctness (use measured variant) ──
-    compiled_measure(A_, B_, C_, profiler_)
-    torch.cuda.synchronize()
-    C_ref = torch.matmul(A, B.T)
-    max_diff = (C - C_ref).abs().max().item()
-    print(f"Max abs diff: {max_diff:.6f}")
-    assert torch.allclose(C, C_ref, atol=1e-1, rtol=1e-1), f"FAILED ({max_diff})"
-    print("Correctness check PASSED")
-
-    # ── Profiled run ──
-    profiler.zero_()
-    compiled_measure(A_, B_, C_, profiler_)
-    torch.cuda.synchronize()
-    dump_profiler(profiler, num_blocks)
-
-    # ── Benchmark both variants ──
-    time_with = cute.testing.benchmark(
-        compiled_measure,
-        kernel_arguments=cute.testing.JitArguments(A_, B_, C_, profiler_),
-    )
-    time_without = cute.testing.benchmark(
-        compiled_clean,
-        kernel_arguments=cute.testing.JitArguments(A_, B_, C_, profiler_),
-    )
-
-    overhead = time_with - time_without
-    overhead_pct = (overhead / time_without) * 100 if time_without > 0 else 0
-
-    print(f"\n{'Variant':<25s} {'Time (µs)':>10s}")
-    print("-" * 37)
-    print(f"{'With profiling':<25s} {time_with:>10.4f}")
-    print(f"{'Without profiling':<25s} {time_without:>10.4f}")
-    print(f"{'Overhead':<25s} {overhead:>10.4f} ({overhead_pct:.1f}%)")
 
 
 if __name__ == "__main__":

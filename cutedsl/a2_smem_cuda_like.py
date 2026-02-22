@@ -1,5 +1,8 @@
 import cutlass
 import cutlass.cute as cute
+from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.testing import benchmark, JitArguments
+import torch
 
 @cute.jit
 def naive_smem_launcher(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
@@ -57,3 +60,25 @@ def naive_smem_kernel(
         cute.arch.sync_threads()
     
     gC[bidy * bdimy + tidy, bidx * bdimx + tidx] = cute.Float16(acc)
+
+def main():
+    M, N, K = 1024, 1024, 1024
+
+    A = torch.randn((M, K), device="cuda", dtype=torch.float16)
+    B = torch.randn((N, K), device="cuda", dtype=torch.float16)
+    C = torch.empty((M, N), device="cuda", dtype=torch.float16)
+
+    A_ = from_dlpack(A, assumed_align=16)
+    B_ = from_dlpack(B, assumed_align=16)
+    C_ = from_dlpack(C, assumed_align=16)
+
+    compiled = cute.compile(naive_smem_launcher, A_, B_, C_)
+    compiled(A_, B_, C_)
+
+    assert torch.allclose(C, torch.matmul(A, B.T), atol=1e-1, rtol=1e-1), f"CORRECTNESS FAILED"
+    print("CORRECTNESS PASS")
+    time = benchmark(compiled, kernel_arguments=JitArguments(A_, B_, C_))
+    print(f"DURATION: {time:>5.4f} µs\nTFLOPS: {(2 * M * N * K) / (time * 1e6):>5.4f}")
+
+if __name__ == "__main__":
+    main()
