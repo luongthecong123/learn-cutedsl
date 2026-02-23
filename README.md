@@ -22,3 +22,8 @@ python3 -m modal setup
 
 modal submit_modal.py
 ```
+
+```bash
+git config --global user.name "luongthecong123"
+git config --global user.email "luongthecong123@gmail.com"
+```
