@@ -27,3 +27,175 @@ modal submit_modal.py
 git config --global user.name "luongthecong123"
 git config --global user.email "luongthecong123@gmail.com"
 ```
+
+|
+# Compare PipelineAsync and PipelineTmaAsync
+
+Hopper architecture introduces new barrier primitives that help us overlap memory transactions and computation efficiently. CuTeDSL/CUTLASS provides a convenient way to do this through their `PipelineAsync` and `PipelineTmaAsync` APIs.
+
+## PipelineAsync
+
+```python
+# Setup
+pipeline = PipelineAsync.create(
+    num_stages=S,
+    producer_group=CooperativeGroup(Agent.Thread, 128),   # 1 warpgroup
+    consumer_group=CooperativeGroup(Agent.Thread, 128),   # 1 warpgroup
+    barrier_storage=mbar_ptr,
+)
+producer, consumer = pipeline.make_participants()
+```
+
+```python
+# Mainloop
+if warp_group_idx == 0:  # Producer
+    for k in range(K):
+        handle = producer.acquire_and_advance()   # wait for stage to be free
+
+        smem[handle.index] = data[k]              # threads write to smem
+
+        handle.commit()                           # threads signal "data ready"
+
+    producer.tail()
+
+if warp_group_idx == 1:  # Consumer
+    for k in range(K):
+        handle = consumer.wait_and_advance()      # wait for "data ready"
+
+        result += smem[handle.index]              # threads read from smem
+
+        handle.release()                          # signal "stage free"
+```
+
+This is quite trivial, as these are synchronous operations (threads write to smem on the producer side, threads perform MMA using registers on the consumer side). A thread is blocked until it has finished writing data to shared memory, and the same logic applies for MMA on registers — when the instruction returns, the work is done.
+
+The only concern is **race conditions** — one warpgroup could overwrite a shared memory stage before the other warpgroup has finished reading from it, or a consumer could read from a stage before the producer has finished filling it. The pipeline API handles this for us: `acquire` blocks the producer until the consumer has released a stage, and `wait` blocks the consumer until the producer has committed to a stage. The circular buffer of `S` stages allows the producer to run up to `S` iterations ahead of the consumer, hiding memory latency while preventing any data hazards.
+
+## PipelineTmaAsync
+
+To take advantage of new async hardware accelerators like TMA and WGMMA, new barrier primitives are introduced. Even though these operations are asynchronous (the issuing thread returns immediately), we need a way to know when the hardware has actually finished — without spinning or blocking the thread unnecessarily.
+
+**For TMA**, the mechanism is **transaction byte counting** on barriers. When creating the pipeline, we specify `tx_count` — the number of bytes we expect TMA to write into each stage. Each `cute.copy` with a `tma_bar_ptr` tells the TMA hardware: *"when you finish writing these bytes to smem, decrement this barrier's transaction count."* The barrier only completes its phase when both the expected thread arrivals reach zero **and** the transaction byte count reaches zero. This means the producer thread doesn't need to signal anything — the TMA hardware does it automatically, which is why `producer_commit()` is a NOP.
+
+**For WGMMA**, the mechanism is **commit groups and group counting**. WGMMA is also asynchronous — `cute.gemm` returns immediately while the Tensor Cores work in the background, reading from smem. We need to know when WGMMA has finished reading from a given smem stage before we can release it back to the producer. The three primitives for this are:
+
+| Primitive                    | Purpose                                                           |
+|------------------------------|-------------------------------------------------------------------|
+| `warpgroup.fence()`          | Ensures prior memory operations are ordered before WGMMA          |
+| `warpgroup.commit_group()`   | Seals all WGMMA instructions issued since the last commit into one group |
+| `warpgroup.wait_group(N)`    | Blocks until at most `N` committed groups are still in flight     |
+
+Calling `wait_group(1)` means: *"the group I just committed can still be running, but the group from the previous iteration must be done."* This allows one WGMMA group to overlap with pipeline housekeeping (release, wait, acquire) for the next stage — which is critical for hiding Tensor Core latency.
+
+Because the consumer releases a stage **one iteration behind** where it reads, it needs **two separate state trackers**: `consumer_read_state` (which stage to read next) and `consumer_release_state` (which stage to release next, lagging behind).
+
+```python
+# Setup
+mainloop_pipeline = PipelineTmaAsync.create(
+    num_stages=S,
+    producer_group=CooperativeGroup(Agent.Thread, 128),
+    consumer_group=CooperativeGroup(Agent.Thread, 128),
+    barrier_storage=mbar_ptr,
+    tx_count=tma_copy_bytes,          # expected bytes per stage — barrier tracks this
+    cta_layout_vmnk=cta_layout_vmnk,
+)
+producer_state = make_pipeline_state(PipelineUserType.Producer, S)
+consumer_read_state = make_pipeline_state(PipelineUserType.Consumer, S)
+consumer_release_state = make_pipeline_state(PipelineUserType.Consumer, S)
+```
+
+```python
+# Mainloop
+
+# ── Warpgroup 0: Producer (TMA) ───────────────────────
+if warp_group_idx == 0:
+    for k in range(K):
+        mainloop_pipeline.producer_acquire(producer_state)  # wait for stage free
+
+        cute.copy(tma_atom_a, gA[k], sA[producer_state.index],
+                  tma_bar_ptr=mainloop_pipeline.producer_get_barrier(producer_state),
+                  #           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                  #           TMA hardware will decrement this barrier's
+                  #           tx_count when bytes land in smem
+                  )
+        cute.copy(tma_atom_b, gB[k], sB[producer_state.index],
+                  tma_bar_ptr=mainloop_pipeline.producer_get_barrier(producer_state),
+                  )
+
+        mainloop_pipeline.producer_commit(producer_state)   # NOP — TMA signals via
+        producer_state.advance()                            #        tx_count, not threads
+
+# ── Warpgroup 1: Consumer (WGMMA) ─────────────────────
+if warp_group_idx == 1:
+    for k in range(K):
+        mainloop_pipeline.consumer_wait(consumer_read_state)  # wait for tx_count == 0
+                                                              # (TMA bytes all landed)
+
+        cute.nvgpu.warpgroup.fence()                          # order memory before wgmma
+
+        for kb in range(num_k_blocks):                        # issue wgmma — async,
+            cute.gemm(tiled_mma, acc, sA[...], sB[...], acc)  # returns immediately
+
+        cute.nvgpu.warpgroup.commit_group()                   # seal as group G_k
+
+        cute.nvgpu.warpgroup.wait_group(1)                    # wait until G_{k-1} done
+                                                              # (G_k can still be running)
+
+        mainloop_pipeline.consumer_release(                   # release stage from G_{k-1}
+            consumer_release_state)                           # safe: wgmma done reading it
+
+        consumer_read_state.advance()
+        consumer_release_state.advance()
+
+    cute.nvgpu.warpgroup.wait_group(0)                        # drain last group
+```
+
+The timing of each stage's lifecycle looks like this:
+
+```
+                    Stage S lifecycle
+                    ─────────────────
+
+Producer (Warpgroup 0)               Consumer (Warpgroup 1)
+      │                                     │
+      ├─ producer_acquire(S)                │
+      │   (wait for consumer_release)       │
+      │                                     │
+      ├─ TMA copy A → smem[S]              │
+      ├─ TMA copy B → smem[S]              │
+      │   (tied to barrier via tma_bar_ptr) │
+      │                                     │
+      ├─ producer_commit(S) [NOP]           │
+      │                                     │
+      │    ┌──── TMA hardware ────┐         │
+      │    │ writes bytes to smem │         │
+      │    │ decrements tx_count  │         │
+      │    └──────────────────────┘         │
+      │                                     │
+      │         tx_count hits 0 ──────►     ├─ consumer_wait(S) unblocks
+      │                                     │
+      │                                     ├─ warpgroup.fence()
+      │                                     ├─ WGMMA reads from smem[S] (async)
+      │                                     ├─ warpgroup.commit_group()  → G_k
+      │                                     │
+      │                                     ├─ warpgroup.wait_group(1)
+      │                                     │   (confirms G_{k-1} done reading
+      │                                     │    smem[S-1])
+      │                                     │
+      │  ◄──────────────────────────────────├─ consumer_release(S-1)
+      │                                     │
+```
+
+## What About SM120 (Blackwell RTX)?
+
+SM120 has TMA but **does not have WGMMA**. It uses the standard Tensor Core MMA instructions (via `ldmatrix` + `mma`), where operands must live in **registers**, not shared memory. The producer code is identical — TMA is TMA. The consumer side is where things change.
+
+Since MMA reads from registers, the consumer must explicitly copy data from smem to register fragments (`tCrA`, `tCrB`) via `ldmatrix` before issuing the MMA. Both `ldmatrix` and MMA are **synchronous** — when the instruction returns, the data has been fully read from smem (for `ldmatrix`) or the computation is done (for MMA). This means:
+
+- **No `fence` / `commit_group` / `wait_group` needed** — there is no async compute to track.
+- **Only one consumer state tracker** — the stage can be released as soon as the last `ldmatrix` from that stage completes, because MMA never touches smem. No need to delay release by one iteration.
+- **`consumer_release` happens inside the k_block loop**, right at the boundary when the last k_block of a stage finishes its `ldmatrix` copy.
+
+Another pattern in the SM120 code is **double-buffering the smem → register copy with MMA computation**: the `ldmatrix` for the **next** k_block is issued **before** the MMA for the **current** k_block. This overlaps the `ldmatrix` latency with useful MMA compute — classic software pipelining that WGMMA doesn't need because it reads directly from smem.
+
+For the full SM120 implementation, readers can refer to [Junkai Wu's dense_gemm example for SM120](https://github.com/NVIDIA/cutlass/blob/main/python/examples/blackwell_rtx/dense_gemm.py).
