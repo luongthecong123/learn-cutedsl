@@ -2,6 +2,24 @@
 Adding hardware features and optimization techniques brick by brick and measure the FLOPS speed up, making it easier to add CuTeDSL to your codebase according to your needs.
 
 Apart from educational purpose, this repo can be treated as cutedsl api examples. Where readers can pick out a feature/api and add it to their code or inject them as context to LLMs for coding assistance.
+Pros and Cons of cutedsl.
+For example: Feed script a1 + a2 to LLM to spit out script a2_profile...
+
+Disclaimer: How I wrote these explanation: 
+- I did the research from great blogs, then wrote the working code first
+- For the explanation part: I first laid out the main structure with my own explanation, then tell Claude Opus to finish/proof-read/enhance
+
+Pros:
+- Provides quality of life apis to help write efficient cuda kernels
+- Expose low level features for speed of light optimization, you can write it the cute way or the cuda/ptx way
+- Seamless integration with Pytorch with JIT compilation
+- Faster development cycle thanks to Python 
+- Supported by Nvidia ninjas
+- Great examples by the goat Junkai Wu and team
+
+Cons:
+- Too many apis to do the same thing, can be confusing
+- Lack detailed documentation on lots of apis
 
 Job submission using Ray
 ```bash
@@ -28,10 +46,49 @@ git config --global user.name "luongthecong123"
 git config --global user.email "luongthecong123@gmail.com"
 ```
 
-|
 # Compare PipelineAsync and PipelineTmaAsync
 
 Hopper architecture introduces new barrier primitives that help us overlap memory transactions and computation efficiently. CuTeDSL/CUTLASS provides a convenient way to do this through their `PipelineAsync` and `PipelineTmaAsync` APIs.
+
+## Warp Specialization
+
+We call computation the **"consumer"** and memory transaction the **"producer"**, and assign these roles to different warps. On NVIDIA GPUs, a **warp** is a group of 32 threads issued together in lockstep. Individual threads within a warp taking different branches cause **warp divergence** (the branches serialize instead of executing in parallel). However, different warps within a thread block can take entirely different code paths without any performance penalty — they are independently scheduled. This is why we split work by warp, and the technique is called **warp specialization**.
+
+```python
+if warp_group_idx == 0:    # Producer warps — handle memory
+    ...
+if warp_group_idx == 1:    # Consumer warps — handle computation
+    ...
+# Different warps, different paths — no divergence penalty
+```
+
+## Pipeline Communication via Barriers in Shared Memory
+
+Since producer and consumer warps operate independently, we need a mechanism for them to communicate:
+- The producer needs to signal: *"data is ready to be consumed"*
+- The consumer needs to signal: *"I'm done reading, this slot is free to overwrite"*
+
+To achieve this, we store **`mbarrier`** (barrier) objects in **shared memory**, which is accessible by all threads within a thread block. Each pipeline stage gets its own barrier, and the stages are organized as a **circular buffer** — when we reach the last stage, we wrap back to stage 0.
+
+```
+Shared Memory
+┌──────────────────────────────────────────────────┐
+│  mbarrier[0]   mbarrier[1]   ...   mbarrier[S-1]│  ← one per stage
+├──────────────────────────────────────────────────┤
+│  smem_buf[0]   smem_buf[1]   ...   smem_buf[S-1]│  ← data buffers
+└──────────────────────────────────────────────────┘
+
+Producer cycles:  buf[0] → buf[1] → ... → buf[S-1] → buf[0] → ...
+Consumer cycles:  buf[0] → buf[1] → ... → buf[S-1] → buf[0] → ...
+                  (trails behind producer by up to S stages)
+```
+
+Each barrier tracks a **phase** that flips between even and odd. The producer and consumer agree on which phase means "full" (data ready) and which means "empty" (slot free). A barrier completes and advances its phase when the expected number of arrivals is reached. This is what prevents the two fundamental race conditions:
+
+- **Producer overwriting data the consumer hasn't read yet** → producer `acquire` waits on the barrier until the consumer has released that stage
+- **Consumer reading a stage the producer hasn't filled yet** → consumer `wait` blocks on the barrier until the producer has committed that stage
+
+With multiple stages, the producer can run ahead by up to `S` iterations before it must stall, allowing memory latency to be hidden behind computation.
 
 ## PipelineAsync
 
