@@ -10,10 +10,9 @@ def naive_smem_launcher(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
     N = mB.shape[0]
     K = mA.shape[1]
     
-    BM, BN, BK = 16, 16, 16
-    assert BM == BN, f"[NAIVE SMEM ab_] BM ({BM}) must equal BN ({BN})"
+    BM, BN, BK =  8, 4, 16
     
-    naive_smem_kernel(mA, mB, mC, M, N, K).launch(
+    naive_smem_kernel(mA, mB, mC, M, N, K, BM, BN, BK).launch(
         grid=[N // BN, M // BM, 1],
         block=[BM, BN, 1])
 
@@ -22,13 +21,13 @@ def naive_smem_kernel(
     gA: cute.Tensor,  # [M, K]
     gB: cute.Tensor,  # [N, K]
     gC: cute.Tensor,  # [M, N]
-    M: int,
-    N: int,
-    K: int
+    M: int, N: int, K: int,
+    BM: int, BN: int, BK: int
 ):
-    BM, BN, BK = 16, 16, 16
+    BM, BN, BK =  8, 4, 16
     PAD = 8
     
+    # Define and allocate shared memory
     allocator = cutlass.utils.SmemAllocator()
     layout_sA = cute.make_layout((BM, BK), stride=(BK + PAD, 1))
     layout_sB = cute.make_layout((BN, BK), stride=(BK + PAD, 1))
@@ -40,26 +39,30 @@ def naive_smem_kernel(
     tidx, tidy, _ = cute.arch.thread_idx()
     tid = tidy * bdimx + tidx
     num_threads = bdimx * bdimy
+
     acc = cute.Float32(0)
 
     for ctak in range(0, K, BK):
-        # Load sA, sB
-        num_loads = BM * BK
-        for i in range(tid, num_loads, num_threads):
+        num_loads_A = BM * BK
+        for i in range(tid, num_loads_A, num_threads):
             row = i // BK
             col = i % BK
             sA[row, col] = gA[bidy * BM + row, ctak + col]
+
+        num_loads_B = BN * BK
+        for i in range(tid, num_loads_B, num_threads):
+            row = i // BK
+            col = i % BK
             sB[row, col] = gB[bidx * BN + row, ctak + col]
         
         cute.arch.sync_threads()
         
-        # MMa on smem:
         for mmak in range(BK):
-            acc += cute.Float32(sA[tidy, mmak]) * cute.Float32(sB[tidx, mmak])    
+            acc += cute.Float32(sA[tidx, mmak]) * cute.Float32(sB[tidy, mmak])
 
         cute.arch.sync_threads()
     
-    gC[bidy * bdimy + tidy, bidx * bdimx + tidx] = cute.Float16(acc)
+    gC[bidy * BM + tidx, bidx * BN + tidy] = cute.Float16(acc)
 
 def main():
     M, N, K = 1024, 1024, 1024

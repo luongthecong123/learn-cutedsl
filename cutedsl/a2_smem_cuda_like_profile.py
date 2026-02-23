@@ -201,7 +201,7 @@ def naive_smem_kernel(
     if cutlass.const_expr(use_measure) and tid == 0:
         range_start(probe, bid, cnt, sm, TAGS["store"])
 
-    gC[bidy * bdimy + tidy, bidx * bdimx + tidx] = cute.Float16(acc)
+    gC[bidy * BM + tidy, bidx * BN + tidx] = cute.Float16(acc)
 
     if cutlass.const_expr(use_measure) and tid == 0:
         cnt = range_stop(probe, bid, cnt)
