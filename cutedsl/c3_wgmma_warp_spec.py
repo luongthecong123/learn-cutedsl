@@ -59,13 +59,14 @@ class Gemm_TC:
         
         cta_layout_mnk = cute.make_layout((*self.cluster_shape_mn, 1))        
 
+        # self.a_smem_layout_staged:  S<3,4,3> o 0 o ((8,8),(64,1),(1,1)):((64,512),(1,0),(0,0))
         self.a_smem_layout_staged = sm90_utils.make_smem_layout_a(
             a_layout=self.a_layout,
             mma_tiler_mnk=self.tile_shape_mnk,
             a_dtype=self.a_dtype,
             num_stages=self.num_stages
         )
-
+        print("self.a_smem_layout_staged: ", self.a_smem_layout_staged)
         self.b_smem_layout_staged = sm90_utils.make_smem_layout_b(
             b_layout=self.b_layout,
             mma_tiler_mnk=self.tile_shape_mnk,
@@ -206,11 +207,7 @@ class Gemm_TC:
             b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
         )
 
-        c_smem_layout = cute.make_layout(
-            (self.BM, self.BN),
-            stride=(self.BN, 1)
-        )
-        sC = storage.sC.get_tensor(c_smem_layout)
+
 
         tile_coord_mnk = (bidx, bidy, None)
 
@@ -331,6 +328,12 @@ class Gemm_TC:
                 cute.nvgpu.warpgroup.commit_group()
                 cute.nvgpu.warpgroup.wait_group(0)
 
+        c_smem_layout = cute.make_layout(
+            (self.BM, self.BN),
+            stride=(self.BN, 1)
+        )
+        sC = storage.sC.get_tensor(c_smem_layout)
+
         if is_mma_warp:
             tv_layout_C_tiled = tiled_mma.tv_layout_C_tiled
 
@@ -349,7 +352,8 @@ class Gemm_TC:
             coord=tile_coord_mnk,
             proj=(1, 1, None)
         )
-        
+
+
         sC_for_tma_partition = cute.group_modes(sC, 0, 2)
         gC_for_tma_partition = cute.group_modes(gC_tma, 0, 2)
         
@@ -388,7 +392,7 @@ class Gemm_TC:
         return tma_atom, tma_tensor
 
 def main():
-    M, N, K = 4096, 4096, 4096
+    M, N, K = 4096*2, 4096*2, 4096*2
 
 
     A = torch.randn((M, K), device="cuda", dtype=torch.float16)

@@ -156,7 +156,7 @@ def dump_probe(probe: torch.Tensor, num_blocks: int,
 class Gemm_TC:
     def __init__(
         self,
-        cta_tiler: Tuple[int, int, int] = (128, 128, 64),
+        cta_tiler: Tuple[int, int, int] = (64, 128, 64),
     ):
         self.tile_shape_mnk = cta_tiler
         self.BM, self.BN, self.BK = self.tile_shape_mnk
@@ -562,8 +562,8 @@ class Gemm_TC:
 # ── Main ────────────────────────────────────────────────────────────
 
 def main():
-    M, N, K = 128, 128, 256
-    tile_shape = (128, 128, 64)
+    M, N, K = 64, 128, 256
+    tile_shape = (64, 128, 64)
     bM, bN, bK = tile_shape
 
     A = torch.randn((M, K), device="cuda", dtype=torch.float16)
