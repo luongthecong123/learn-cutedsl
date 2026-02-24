@@ -49,6 +49,23 @@ git config --global user.name "luongthecong123"
 git config --global user.email "luongthecong123@gmail.com"
 ```
 
+# Introduction
+- If reader is new to the concept of massively parallel programming with CUDA, it is suggested to be familar with the first gateway example: vector addition, there are plenty of explanations online for this. Here, I provide an example code with cutedsl, CUDA has a broader example ecosystem with youtube videos and blog post explanations.
+- After familiar with simple vector addition, it's time to get to understand how to perform General Matrix Multiplication (GEMM) in a parallel fashion (example a1), then using shared memory to speed it up (example a2).
+- Next, usage of warp matrix multiplication addition (WMMA) with tensor core, there are great blogs from Lei Mao that provides example as well as great explanation https://leimao.github.io/blog/NVIDIA-Tensor-Core-Programming/ . In CUDA, b1, wmma apis are used to simplify tensor core programming, but in cutedsl or cutlass cute, the consensus is to provide a wrapper on ptx instructions, hence lower level than the CUDA C++ counterpart when it comes to tensor core programming.
+
+# Thread-register to mn coordinate mapping and layer fusion optimization
+In CUDA optimization, one can choose to optimize a specific operation like GEMM to speed of light, which is more tedious and time-consuming. Or one can choose to optimize ...
+
+# Tensor Memory Accelerator (TMA)
+
+Hopper and above provides a memory accelerator called TMA. 
+Normally, without TMA, the flow to store data to shared memory is: GMEM -> register -> SMEM, which requires register allocation. TMA bypass the register step and store data straight to SMEM asynchronously, hence leaves us with more register to program with.
+Example c1 provides a way to use TMA with WMMA, which makes this code runnable on Hopper SM90, Blackwell SM100 and SM120. Using TMA as a drop in replacement for SMEM loading and result storing provides a nice speedup.
+
+# Warp group matrix multiplication (WGMMA)
+Hopper also provides a faster tensor core instruction called WGMMA, which requires a warpgroup (4 warps) to issue. This instruction is also async, combining TMA and WGMMA with the new barriers described in the next section provides neat pipeline to overlap computation with data copy.
+
 # Compare PipelineAsync and PipelineTmaAsync
 
 Hopper architecture introduces new barrier primitives that help us overlap memory transactions and computation efficiently. CuTeDSL/CUTLASS provides a convenient way to do this through their `PipelineAsync` and `PipelineTmaAsync` APIs.
@@ -260,6 +277,13 @@ Another pattern in the SM120 code is **double-buffering the smem → register co
 
 For the full SM120 implementation, readers can refer to [Junkai Wu's dense_gemm example for SM120](https://github.com/NVIDIA/cutlass/blob/main/python/examples/blackwell_rtx/dense_gemm.py).
 
+# Profiling asynchronous warp specialization with probing
+
+To know if our async pipeline is actually doing overlapping, we need to be able to measure them. Take inspiration from gau-nernst's blog post, I re-implemented his probing code in cutedsl, which requires the usage of inline ptx to call a globaltimer instruction with returns the current clock time.
+
+# Blackwell tcgen05 matrix multiplication
+
+Blackwell provides a new tensor core instruction, which doesn't need ...
 
 # Reference:
 1. https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL
