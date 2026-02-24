@@ -1,18 +1,21 @@
 # learn-cutedsl
 Adding hardware features and optimization techniques brick by brick and measure the FLOPS speed up, making it easier to add CuTeDSL to your codebase according to your needs.
 
-Apart from educational purpose, this repo can be treated as cutedsl api examples. Where readers can pick out a feature/api and add it to their code or inject them as context to LLMs for coding assistance.
-Pros and Cons of cutedsl.
+Apart from educational purpose, this repo can be treated as cutedsl api examples. Where readers can pick out a feature/api and add it to their code or inject them as context to LLMs for coding assistance, thanks to LLMs being few-shot learners.
+
 For example: Feed script a1 + a2 to LLM to spit out script a2_profile...
 
 Disclaimer: How I wrote these explanation: 
 - I did the research from great blogs, then wrote the working code first
 - For the explanation part: I first laid out the main structure with my own explanation, then tell Claude Opus to finish/proof-read/enhance
 
+Pros and Cons of cutedsl.
+
 Pros:
 - Provides quality of life apis to help write efficient cuda kernels
 - Expose low level features for speed of light optimization, you can write it the cute way or the cuda/ptx way
 - Seamless integration with Pytorch with JIT compilation
+- Blazing fast compilation
 - Faster development cycle thanks to Python 
 - Supported by Nvidia ninjas
 - Great examples by the goat Junkai Wu and team
@@ -113,7 +116,7 @@ if warp_group_idx == 0:  # Producer
 
         handle.commit()                           # threads signal "data ready"
 
-    producer.tail()
+    producer.tail()                               # ensure all used buffers are properly synchronized before producer exit.
 
 if warp_group_idx == 1:  # Consumer
     for k in range(K):
@@ -256,3 +259,12 @@ Since MMA reads from registers, the consumer must explicitly copy data from smem
 Another pattern in the SM120 code is **double-buffering the smem → register copy with MMA computation**: the `ldmatrix` for the **next** k_block is issued **before** the MMA for the **current** k_block. This overlaps the `ldmatrix` latency with useful MMA compute — classic software pipelining that WGMMA doesn't need because it reads directly from smem.
 
 For the full SM120 implementation, readers can refer to [Junkai Wu's dense_gemm example for SM120](https://github.com/NVIDIA/cutlass/blob/main/python/examples/blackwell_rtx/dense_gemm.py).
+
+
+# Reference:
+1. https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL
+2. https://cudaforfun.substack.com/p/outperforming-cublas-on-h100-a-worklog
+3. https://research.colfax-intl.com/tutorial-hopper-tma/
+4. https://research.colfax-intl.com/cutlass-tutorial-wgmma-hopper/
+5. https://gau-nernst.github.io/tcgen05/
+6. https://hazyresearch.stanford.edu/blog/2026-02-19-tk-2

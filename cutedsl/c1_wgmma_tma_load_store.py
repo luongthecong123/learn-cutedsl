@@ -12,14 +12,14 @@ from cutlass.cute.testing import benchmark, JitArguments
 class Gemm_TC:
     def __init__(
         self,
-        cta_tiler: Tuple[int, int, int] = (128, 128, 64),
+        cta_tiler: Tuple[int, int, int] = (64, 128, 64),
     ):
         self.tile_shape_mnk = cta_tiler
-        self._bM, self._bN, self._bK = self.tile_shape_mnk
+        self.BM, self.BN, self.BK = self.tile_shape_mnk
         
         self.atom_layout_mnk = (
             (2, 1, 1)
-            if self._bM > 64 and self._bN > 64
+            if self.BM > 64 and self.BN > 64
             else (1, 1, 1)
         )
         
@@ -29,8 +29,8 @@ class Gemm_TC:
         self.mma_warp_groups = math.prod(self.atom_layout_mnk)
         self.threads_per_cta = self.mma_warp_groups * self.num_threads_per_warp_group
         
-        assert self._bM % 64 == 0, "bM must be divisible by 64 for WGMMA"
-        assert self._bN % 64 == 0, "bN must be divisible by 64 for WGMMA"
+        assert self.BM % 64 == 0, "bM must be divisible by 64 for WGMMA"
+        assert self.BN % 64 == 0, "bN must be divisible by 64 for WGMMA"
 
         self.num_stages = 1
         
@@ -54,12 +54,14 @@ class Gemm_TC:
         
         cta_layout_mnk = cute.make_layout((*self.cluster_shape_mn, 1))        
 
+        # Create swizzled layout: S<3,4,3> o 0 o ((8,16),(64,1),(1,1)):((64,512),(1,0),(0,0))
         self.a_smem_layout_staged = sm90_utils.make_smem_layout_a(
             a_layout=self.a_layout,
             mma_tiler_mnk=self.tile_shape_mnk,
             a_dtype=self.a_dtype,
             num_stages=self.num_stages
         )
+        print("self.a_smem_layout_staged: ", self.a_smem_layout_staged)
 
         self.b_smem_layout_staged = sm90_utils.make_smem_layout_b(
             b_layout=self.b_layout,
@@ -132,7 +134,7 @@ class Gemm_TC:
 
         print("tiled_mma: ", self.tiled_mma)
         
-        grid_dim = *cute.ceil_div(c.shape, (self._bM, self._bN)), 1
+        grid_dim = *cute.ceil_div(c.shape, (self.BM, self.BN)), 1
         self.kernel(
             tma_atom_a, 
             tma_tensor_a,
@@ -203,8 +205,8 @@ class Gemm_TC:
         )
         
         c_smem_layout = cute.make_layout(
-            (self._bM, self._bN),
-            stride=(self._bN, 1)
+            (self.BM, self.BN),
+            stride=(self.BN, 1)
         )
         sC = storage.sC.get_tensor(c_smem_layout)
 
@@ -270,7 +272,7 @@ class Gemm_TC:
 
         mbar_ptr = storage.mainloop_pipeline_array_ptr.data_ptr()
 
-        k_tile_cnt = mA_tma_tensor.shape[1] // self._bK
+        k_tile_cnt = mA_tma_tensor.shape[1] // self.BK
         
         tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
 

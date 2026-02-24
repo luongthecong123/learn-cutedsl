@@ -1,29 +1,28 @@
-import torch
-import ray
-from typing import Tuple
-
-
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.testing import benchmark, JitArguments
 import cutlass.utils.hopper_helpers as sm90_utils
-from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils as utils
+from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+from typing import Tuple
 
-@ray.remote(num_gpus=1)
+import torch
+
+
 class Gemm_TC:
     def __init__(
         self,
         cta_tiler: Tuple[int, int, int] = (64, 64, 64),
     ):
         self.tile_shape_mnk = cta_tiler
-        self._bM, self._bN, self._bK = self.tile_shape_mnk
+        self.BM, self.BN, self.BK = self.tile_shape_mnk
         self.mma_inst_shape = (16, 8, 16)
         self.atom_layout_mnk = (4, 4, 1)
         self.warp_size = cute.arch.WARP_SIZE
         self.threads_per_cta = self.warp_size * self.atom_layout_mnk[0] * self.atom_layout_mnk[1]
-        assert self._bM % 16 == 0, "bM must be divisible by 16"
-        assert self._bN % 16 == 0, "bN must be divisible by 16"
+        assert self.BM % 16 == 0, "bM must be divisible by 16"
+        assert self.BN % 16 == 0, "bN must be divisible by 16"
 
         self.num_stages = 1
         assert self.num_stages == 1, "Only single-stage TMA is supported in this implementation"
@@ -47,12 +46,14 @@ class Gemm_TC:
         
         cta_layout_mnk = cute.make_layout((*self.cluster_shape_mn, 1))        
 
+        # Create swizzled layout: S<3,4,3> o 0 o ((8,8),(64,1),(1,1)):((64,512),(1,0),(0,0))
         self.a_smem_layout_staged = sm90_utils.make_smem_layout_a(
             a_layout=self.a_layout,
             mma_tiler_mnk=self.tile_shape_mnk,
             a_dtype=self.a_dtype,
             num_stages=self.num_stages
         )
+        print("self.a_smem_layout_staged: ", self.a_smem_layout_staged)
 
         self.b_smem_layout_staged = sm90_utils.make_smem_layout_b(
             b_layout=self.b_layout,
@@ -101,10 +102,8 @@ class Gemm_TC:
             ab_dtype=cutlass.Float16, acc_dtype=cutlass.Float32, shape_mnk=self.mma_inst_shape)
         
         permutation_mnk = (
-            self.atom_layout_mnk[0] * self.mma_inst_shape[0], # 4 * 16 = 64
-            # if atom layout's N-mode is 1, to leverage the largest coalesced
-            # shared memory -> register copy, set the tiled mma's N mode to 16
-            self.atom_layout_mnk[1] * self.mma_inst_shape[1] * 2, # 4 * 8 * 2 = 64
+            self.atom_layout_mnk[0] * self.mma_inst_shape[0],
+            self.atom_layout_mnk[1] * self.mma_inst_shape[1] * 2,
             self.atom_layout_mnk[2] * self.mma_inst_shape[2],
         )     
         
@@ -114,14 +113,14 @@ class Gemm_TC:
             permutation_mnk=permutation_mnk)
 
         print("tiled_mma: ", tiled_mma)
-        # grid_dim: ((m + BLK_M - 1) // BLK_M, (n + BLK_N - 1) // BLK_N, 1)
-        grid_dim = *cute.ceil_div(c.shape, (self._bM, self._bN)), 1
+
+        grid_dim = *cute.ceil_div(c.shape, (self.BM, self.BN)), 1
         self.kernel(
             tma_atom_a, 
             tma_tensor_a,
             tma_atom_b,
             tma_tensor_b,
-            c,  # output tensor
+            c,
             tiled_mma,
             cta_layout_mnk,
             self.a_smem_layout_staged,
@@ -130,8 +129,6 @@ class Gemm_TC:
             grid=grid_dim, 
             block=(self.threads_per_cta,1,1)
         )
-
-        cutlass.pipeline.arrive_and_wait
     
     @cute.kernel
     def kernel(
@@ -150,7 +147,6 @@ class Gemm_TC:
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
-        # Prefetch TMA descriptor
         if warp_idx == 0:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)  
@@ -164,15 +160,8 @@ class Gemm_TC:
         tid, _, _ = cute.arch.thread_idx()    
         thr_mma = tiled_mma.get_slice(tid)
 
-        # Shared memory
         a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
         b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, 0))
-        tma_copy_bytes = cute.size_in_bytes(
-            self.a_dtype, a_smem_layout
-        ) + cute.size_in_bytes(self.b_dtype, b_smem_layout)
-
-        print("a smem layout staged: ", a_smem_layout_staged)
-        print("a smem layout: ", a_smem_layout)
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
@@ -213,9 +202,6 @@ class Gemm_TC:
             cute.group_modes(gA, 0, 2),
         )
 
-        print("tAgA: ", tAgA)
-        print("tAsA: ", tAsA)
-
         b_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (None, 0, 0)).shape)
         b_cta_crd = cluster_coord_mnk[0]
         tBsB, tBgB = cute.nvgpu.cpasync.tma_partition(
@@ -226,8 +212,6 @@ class Gemm_TC:
             cute.group_modes(gB, 0, 2),
         )
         
-        # ====================== Registers allocation for  MmaF16BF16Op
-        # Slice sA/sB to remove stage dimension for MMA partitioning (stage 0)
         sA_mma = cute.slice_(sA, (None, None, 0))
         sB_mma = cute.slice_(sB, (None, None, 0))
         
@@ -241,7 +225,6 @@ class Gemm_TC:
 
         tCrC.fill(0.0)
         
-        # Creates the tiled copy so that it matches the thread-value layout
         atom_copy_s2r_A = cute.make_copy_atom(
             cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False,num_matrices=4),
             self.a_dtype,
@@ -262,48 +245,40 @@ class Gemm_TC:
         tCsB_copy_view = thr_copy_ldmatrix_B.partition_S(sB_mma)
         tCrB_copy_view = thr_copy_ldmatrix_B.retile(tCrB)
         
-
-        # Calculate TMA transaction bytes for synchronization
         tma_transaction_bytes = cute.size_in_bytes(
             self.a_dtype, a_smem_layout
         ) + cute.size_in_bytes(self.b_dtype, b_smem_layout)
 
-        # Get pointer to mbarrier in shared memory
         mbar_ptr = storage.mainloop_pipeline_array_ptr.data_ptr()
 
-        for kidx in range(mA_mk.shape[1] // self._bK):
-            # Reinitialize mbarrier each iteration (simpler for single-stage)
+        for kidx in range(mA_mk.shape[1] // self.BK):
             if tid == 0:
                 cute.arch.mbarrier_init(mbar_ptr, cnt=1)
                 cute.arch.mbarrier_init_fence()
             
             cute.arch.sync_threads()
             
-            # Set expected transaction bytes and arrive (single thread)
             if warp_idx == 0:
                 if tid == 0:
                     cute.arch.mbarrier_expect_tx(mbar_ptr, tma_transaction_bytes)
                     cute.arch.mbarrier_arrive(mbar_ptr)
 
-                # Issue TMA copies - whole warp calls, internal elect_one handles single-thread
                 cute.copy(
                     tma_atom_a,
                     tAgA[None, kidx],
-                    tAsA[None, 0],  # 0 for single stage
+                    tAsA[None, 0],
                     tma_bar_ptr=mbar_ptr
                 )
                 
                 cute.copy(
                     tma_atom_b,
                     tBgB[None, kidx],
-                    tBsB[None, 0],  # 0 for single stage
+                    tBsB[None, 0],
                     tma_bar_ptr=mbar_ptr
                 )
 
-            # Wait for TMA to complete
             cute.arch.mbarrier_wait(mbar_ptr, 0)
 
-            # Load from SMEM to registers
             cute.copy(
                 atom=tiled_copy_s2r_A,
                 src=tCsA_copy_view,
@@ -316,7 +291,6 @@ class Gemm_TC:
                 dst=tCrB_copy_view
             )
             
-            # GEMM
             cute.gemm(
                 atom=tiled_mma,
                 d=tCrC,
@@ -350,20 +324,6 @@ class Gemm_TC:
         smem_tile: tuple[int, int],
         mcast_dim: int,
     ) -> tuple[cute.CopyAtom, cute.Tensor]:
-        """Create TMA atoms and tensors for input tensors.
-
-        :param tensor: Input tensor (A or B)
-        :type tensor: cute.Tensor
-        :param smem_layout_staged: Shared memory layout for the tensor
-        :type smem_layout_staged: cute.ComposedLayout
-        :param smem_tile: Shared memory tile shape
-        :type smem_tile: Tuple[int, int]
-        :param mcast_dim: Multicast dimension
-        :type mcast_dim: int
-
-        :return: TMA atom and tensor
-        :rtype: Tuple[cute.CopyAtom, cute.Tensor]
-        """
         op = (
             cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
             if mcast_dim == 1
@@ -380,88 +340,27 @@ class Gemm_TC:
         )
         return tma_atom, tma_tensor
 
-    def run_gemm(self, M: int = 64, N: int = 64, K: int = 64, 
-                 iterations: int = 10, abs_tol: float = 1e-5, rel_tol: float = 1e-5):
-        import time
-        
-        device = torch.device("cuda")
-        print(f"Running GEMM on device: {device}")
-        print(f"M: {M}, N: {N}, K: {K}")
-        
-        torch.manual_seed(42)
-        
-        # Create test matrices
-        a = torch.randn(M, K, device=device, dtype=torch.float16)
-        b = torch.randn(N, K, device=device, dtype=torch.float16)
-        c = torch.zeros(M, N, device=device, dtype=torch.float16)
-        
-        a_ = from_dlpack(a, assumed_align=16)
-        b_ = from_dlpack(b, assumed_align=16)
-        c_ = from_dlpack(c, assumed_align=16)
-
-        output = torch.zeros_like(c)
-        output_ = from_dlpack(output, assumed_align=16)       
-
-        # Ref
-        c_test = a @ b.T
-        
-        # Impl
-        compiled_code = cute.compile(self, a_, b_, output_)
-
-        # Warmup
-        compiled_code(a_, b_, output_)
-        torch.cuda.synchronize()
-
-        abs_diff = torch.abs(c_test - output)
-        rel_diff = abs_diff / (torch.abs(c_test) + 1e-8)
-        
-        if abs_diff.mean().item() > abs_tol or rel_diff.mean().item() > rel_tol:
-            return f"ERROR: Tolerance exceeded - abs_diff: {abs_diff.mean().item():.6f} (tol: {abs_tol}), rel_diff: {rel_diff.mean().item():.6f} (tol: {rel_tol})"
-
-        start_time = time.time()
-        for i in range(iterations):
-            output = torch.zeros_like(c)
-            output_ = from_dlpack(output, assumed_align=16)
-            compiled_code(a_, b_, output_)
-            torch.cuda.synchronize()
-        
-        elapsed_time = time.time() - start_time
-        avg_time_ms = (elapsed_time / iterations) * 1000
-        
-        ops_per_gemm = 2 * M * N * K
-        tflops = ops_per_gemm / (avg_time_ms / 1000) / 1e12
-        
-        result_str = (
-            f"Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A'}\n"
-            f"Matrix Shape (M, N, K): {(M, N, K)}\n"
-            f"Iterations: {iterations}\n"
-            f"Avg Time per GEMM: {avg_time_ms:.4f}ms\n"
-            f"Performance: {tflops:.2f} TFLOPS\n"
-            f"Mean Absolute Diff: {abs_diff.mean().item():.6f}\n"
-            f"Mean Relative Diff: {rel_diff.mean().item():.6f}"
-        )
-        
-        return result_str
-
 
 def main():
-    if not ray.is_initialized():
-        ray.init()
-    num_gpus = int(ray.available_resources().get("GPU", 0))
-    num_workers = 1
-    print(f"Detected {num_gpus} GPUs. Creating {num_workers} worker.")
-    workers = [Gemm_TC.remote(cta_tiler=(64, 64, 64)) for i in range(num_workers)]
-    M, N, K = 8192, 8192, 8192
-    iterations = 10
-    futures = [worker.run_gemm.remote(M=M, N=N, K=K, iterations=iterations) for worker in workers]
-    results = ray.get(futures)
-    for idx, result in enumerate(results):
-        print(f"\nWorker {idx}:")
-        print(result)
-    
-    ray.shutdown()
+    M, N, K = 4096, 4096, 4096
+
+    A = torch.randn((M, K), device="cuda", dtype=torch.float16)
+    B = torch.randn((N, K), device="cuda", dtype=torch.float16)
+    C = torch.empty((M, N), device="cuda", dtype=torch.float16)
+
+    A_ = from_dlpack(A, assumed_align=16)
+    B_ = from_dlpack(B, assumed_align=16)
+    C_ = from_dlpack(C, assumed_align=16)
+
+    gemm = Gemm_TC(cta_tiler=(64, 64, 64))
+    compiled = cute.compile(gemm, A_, B_, C_)
+    compiled(A_, B_, C_)
+
+    assert torch.allclose(C, torch.matmul(A, B.T), atol=1e-1, rtol=1e-1), "CORRECTNESS FAILED"
+    print("CORRECTNESS PASS")
+    time = benchmark(compiled, kernel_arguments=JitArguments(A_, B_, C_))
+    print(f"DURATION: {time:>5.4f} µs\nTFLOPS: {(2 * M * N * K) / (time * 1e6):>5.4f}")
 
 
 if __name__ == "__main__":
     main()
-    

@@ -159,11 +159,11 @@ class Gemm_TC:
         cta_tiler: Tuple[int, int, int] = (128, 128, 64),
     ):
         self.tile_shape_mnk = cta_tiler
-        self._bM, self._bN, self._bK = self.tile_shape_mnk
+        self.BM, self.BN, self.BK = self.tile_shape_mnk
 
         self.atom_layout_mnk = (
             (2, 1, 1)
-            if self._bM > 64 and self._bN > 64
+            if self.BM > 64 and self.BN > 64
             else (1, 1, 1)
         )
 
@@ -175,8 +175,8 @@ class Gemm_TC:
             self.mma_warp_groups * self.warp_group_size + self.warp_size
         )
 
-        assert self._bM % 64 == 0
-        assert self._bN % 64 == 0
+        assert self.BM % 64 == 0
+        assert self.BN % 64 == 0
 
         self.num_stages = 1
         self.buffer_align_bytes = 1024
@@ -235,20 +235,20 @@ class Gemm_TC:
 
         tma_atom_a, tma_tensor_a = self._make_tma_atoms_and_tensors(
             a, self.a_smem_layout_staged,
-            (self._bM, self._bK), 1,
+            (self.BM, self.BK), 1,
         )
         tma_atom_b, tma_tensor_b = self._make_tma_atoms_and_tensors(
             b, self.b_smem_layout_staged,
-            (self._bN, self._bK), 1,
+            (self.BN, self.BK), 1,
         )
 
         c_smem_layout = cute.make_layout(
-            (self._bM, self._bN), stride=(self._bN, 1),
+            (self.BM, self.BN), stride=(self.BN, 1),
         )
         tma_atom_c, tma_tensor_c = cute.nvgpu.cpasync.make_tiled_tma_atom(
             cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(),
             c, c_smem_layout,
-            (self._bM, self._bN),
+            (self.BM, self.BN),
         )
 
         @cute.struct
@@ -270,7 +270,7 @@ class Gemm_TC:
             ]
             sC: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.c_dtype, self._bM * self._bN
+                    self.c_dtype, self.BM * self.BN
                 ],
                 self.buffer_align_bytes,
             ]
@@ -284,10 +284,10 @@ class Gemm_TC:
             self.b_layout.sm90_mma_major_mode(),
             self.acc_dtype,
             self.atom_layout_mnk,
-            tiler_mn=(64, self._bN),
+            tiler_mn=(64, self.BN),
         )
 
-        grid_dim = *cute.ceil_div(c.shape, (self._bM, self._bN)), 1
+        grid_dim = *cute.ceil_div(c.shape, (self.BM, self.BN)), 1
         self.kernel(
             tma_atom_a, tma_tensor_a,
             tma_atom_b, tma_tensor_b,
@@ -365,7 +365,7 @@ class Gemm_TC:
             b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
         )
         c_smem_layout = cute.make_layout(
-            (self._bM, self._bN), stride=(self._bN, 1)
+            (self.BM, self.BN), stride=(self.BN, 1)
         )
         sC = storage.sC.get_tensor(c_smem_layout)
 
@@ -410,8 +410,8 @@ class Gemm_TC:
         ) + cute.size_in_bytes(self.b_dtype, b_smem_layout)
 
         mbar_ptr = storage.mainloop_pipeline_array_ptr.data_ptr()
-        k_tile_cnt = mA_tma_tensor.shape[1] // self._bK
-        num_k_blocks = self._bK // 16
+        k_tile_cnt = mA_tma_tensor.shape[1] // self.BK
+        num_k_blocks = self.BK // 16
 
         # ── MMA partitioning ──
         warp_group_idx = cute.arch.make_warp_uniform(

@@ -1,24 +1,26 @@
-import torch
-from typing import Tuple
-import math
-
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.testing import benchmark, JitArguments
 import cutlass.utils.hopper_helpers as sm90_utils
 import cutlass.utils as utils
+from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+from typing import Tuple
+
+import math
+import torch
 
 class Gemm_TC:
     def __init__(
         self,
-        cta_tiler: Tuple[int, int, int] = (128, 128, 64),
+        cta_tiler: Tuple[int, int, int] = (64, 128, 64),
     ):
         self.tile_shape_mnk = cta_tiler
-        self._bM, self._bN, self._bK = self.tile_shape_mnk
+        self.BM, self.BN, self.BK = self.tile_shape_mnk
         
         self.atom_layout_mnk = (
             (2, 1, 1)
-            if self._bM > 64 and self._bN > 64
+            if self.BM > 64 and self.BN > 64
             else (1, 1, 1)
         )
         
@@ -28,8 +30,8 @@ class Gemm_TC:
         self.mma_warp_groups = math.prod(self.atom_layout_mnk)
         self.threads_per_cta = self.mma_warp_groups * self.warp_group_size + self.warp_size
         
-        assert self._bM % 64 == 0, "bM must be divisible by 64 for WGMMA"
-        assert self._bN % 64 == 0, "bN must be divisible by 64 for WGMMA"
+        assert self.BM % 64 == 0, "bM must be divisible by 64 for WGMMA"
+        assert self.BN % 64 == 0, "bN must be divisible by 64 for WGMMA"
 
         self.num_stages = 1
         
@@ -132,10 +134,8 @@ class Gemm_TC:
             self.atom_layout_mnk,
             tiler_mn=(64, self.tile_shape_mnk[1]),
         )
-
-        print("tiled_mma: ", self.tiled_mma)
         
-        grid_dim = *cute.ceil_div(c.shape, (self._bM, self._bN)), 1
+        grid_dim = *cute.ceil_div(c.shape, (self.BM, self.BN)), 1
         self.kernel(
             tma_atom_a, 
             tma_tensor_a,
@@ -207,8 +207,8 @@ class Gemm_TC:
         )
 
         c_smem_layout = cute.make_layout(
-            (self._bM, self._bN),
-            stride=(self._bN, 1)
+            (self.BM, self.BN),
+            stride=(self.BN, 1)
         )
         sC = storage.sC.get_tensor(c_smem_layout)
 
@@ -261,14 +261,15 @@ class Gemm_TC:
         ) + cute.size_in_bytes(self.b_dtype, b_smem_layout)
 
         mbar_ptr = storage.mainloop_pipeline_array_ptr.data_ptr()
-        k_tile_cnt = mA_tma_tensor.shape[1] // self._bK
-        num_k_blocks = self._bK // 16
+        k_tile_cnt = mA_tma_tensor.shape[1] // self.BK
+        num_k_blocks = self.BK // 16
 
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.warp_group_size)
         warp_group_thread_layout = cute.make_layout(
             self.mma_warp_groups, stride=self.warp_group_size
         )
         thr_mma = tiled_mma.get_slice(warp_group_thread_layout(warp_group_idx))
+        print("thr_mma: ", thr_mma)
 
         tCgC = thr_mma.partition_C(gC)
         tCsA = thr_mma.partition_A(sA)
@@ -385,3 +386,27 @@ class Gemm_TC:
             num_multicast=mcast_dim,
         )
         return tma_atom, tma_tensor
+
+def main():
+    M, N, K = 4096, 4096, 4096
+
+
+    A = torch.randn((M, K), device="cuda", dtype=torch.float16)
+    B = torch.randn((N, K), device="cuda", dtype=torch.float16)
+    C = torch.empty((M, N), device="cuda", dtype=torch.float16)
+
+    A_ = from_dlpack(A, assumed_align=16)
+    B_ = from_dlpack(B, assumed_align=16)
+    C_ = from_dlpack(C, assumed_align=16)
+
+    gemm = Gemm_TC()
+    compiled = cute.compile(gemm, A_, B_, C_)
+    compiled(A_, B_, C_)
+
+    assert torch.allclose(C, torch.matmul(A, B.T), atol=1e-1, rtol=1e-1), f"CORRECTNESS FAILED"
+    print("CORRECTNESS PASS")
+    time = benchmark(compiled, kernel_arguments=JitArguments(A_, B_, C_))
+    print(f"DURATION: {time:>5.4f} µs\nTFLOPS: {(2 * M * N * K) / (time * 1e6):>5.4f}")
+
+if __name__ == "__main__":
+    main()
