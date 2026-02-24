@@ -89,6 +89,9 @@ class GemmPipeAsync:
 
         producer, consumer = mainloop_pipeline.make_participants()
 
+        print("producer: ", producer)
+        print("consumer: ", consumer)
+
         # Producer warp
         if warp_idx == 0:
             tid, _, _ = cute.arch.thread_idx()

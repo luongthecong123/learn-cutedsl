@@ -38,7 +38,7 @@ def naive_kernel(
     gC[bidy * bdimy + tidy, bidx * bdimx + tidx] = cute.Float16(acc)
 
 def main():
-    M, N, K = 32, 32, 256
+    M, N, K = 256, 256, 256
 
     A = torch.randn((M, K), device="cuda", dtype=torch.float16)
     B = torch.randn((N, K), device="cuda", dtype=torch.float16)

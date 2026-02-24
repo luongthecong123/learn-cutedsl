@@ -25,14 +25,27 @@ def naive_smem_kernel(
     BM: int, BN: int, BK: int
 ):
     BM, BN, BK =  16, 16, 16
-    PAD = 8
+    PAD = 0
     
     # Define and allocate shared memory
     allocator = cutlass.utils.SmemAllocator()
     layout_sA = cute.make_layout((BM, BK), stride=(BK + PAD, 1))
     layout_sB = cute.make_layout((BN, BK), stride=(BK + PAD, 1))
-    sA = allocator.allocate_tensor(cutlass.Float16, layout_sA, 16, None)
-    sB = allocator.allocate_tensor(cutlass.Float16, layout_sB, 16, None)
+
+    layout_sA_swizzled = cute.make_composed_layout(
+        inner=cute.make_swizzle(3, 4, 3),
+        offset=0,
+        outer=layout_sA
+    )
+
+    layout_sB_swizzled = cute.make_composed_layout(
+        inner=cute.make_swizzle(3, 4, 3),
+        offset=0,
+        outer=layout_sB
+    )
+
+    sA = allocator.allocate_tensor(cutlass.Float16, layout_sA_swizzled, 16, None)
+    sB = allocator.allocate_tensor(cutlass.Float16, layout_sB_swizzled, 16, None)
 
     bidx, bidy, _ = cute.arch.block_idx()
     bdimx, bdimy, _ = cute.arch.block_dim()
