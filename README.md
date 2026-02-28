@@ -1,28 +1,28 @@
 # learn-cutedsl
 Adding hardware features and optimization techniques brick by brick and measure the FLOPS speed up, making it easier to add CuTeDSL to your codebase according to your needs.
 
-Apart from educational purpose, this repo can be treated as cutedsl api examples. Where readers can pick out a feature/api and add it to their code or inject them as context to LLMs for coding assistance, thanks to LLMs being few-shot learners.
+Apart from educational purpose, this repo can be treated as commonly used cutedsl api examples. Where readers can pick out a feature/api and add it to their code or inject them as context to LLMs for coding assistance, thanks to LLMs being few-shot learners.
 
 For example: Feed script a1 + a2 to LLM to spit out script a2_profile...
 
-Disclaimer: How I wrote these explanation: 
-- I did the research from great blogs, then wrote the working code first
-- For the explanation part: I first laid out the main structure with my own explanation, then tell Claude Opus to finish/proof-read/enhance
+Disclaimer: Most of this documentation were written by human. LLMs helped proof-reading and formatting.
 
-Pros and Cons of cutedsl.
+Below are the pros and cons that I observed while learning cutedsl:
 
 Pros:
 - Provides quality of life apis to help write efficient cuda kernels
-- Expose low level features for speed of light optimization, you can write it the cute way or the cuda/ptx way
+- Easier to learn compared to CUTLASS CuTe C++ counterpart which can be daunting to start learning with its highly templated code
+- Expose low level features for speed of light (SoL) optimization, you can write it the cute way or the cuda/ptx way
 - Seamless integration with Pytorch with JIT compilation
 - Blazing fast compilation
 - Faster development cycle thanks to Python 
-- Supported by Nvidia ninjas
-- Great examples by the goat Junkai Wu and team
+- Latest hardware features on new Nvidia GPUs are supported
+- Great SoL examples by Junkai Wu and team
 
 Cons:
-- Too many apis to do the same thing, can be confusing
+- Too many apis to do the same thing, can be confusing and hard to master
 - Lack detailed documentation on lots of apis
+- Examples are too complicated due to SoL requirements.
 
 Job submission using Ray
 ```bash
@@ -49,10 +49,81 @@ git config --global user.name "luongthecong123"
 git config --global user.email "luongthecong123@gmail.com"
 ```
 
-# Introduction
-- If reader is new to the concept of massively parallel programming with CUDA, it is suggested to be familar with the first gateway example: vector addition, there are plenty of explanations online for this. Here, I provide an example code with cutedsl, CUDA has a broader example ecosystem with youtube videos and blog post explanations.
-- After familiar with simple vector addition, it's time to get to understand how to perform General Matrix Multiplication (GEMM) in a parallel fashion (example a1), then using shared memory to speed it up (example a2).
+# Learning curve
+- CuTeDSL and CUDA in general, have a very steep but rewarding learning curve, so don't get frustrated the first time you do it. Try to look at example and write kernels by yourself and observe the performance speed up and what makes it speed up. Once you can wrap your head around the concept of massively parallel programming with CUDA, the next kernels will be easier to digest.
+- If reader is new to CUDA, it is suggested to be familar with the first gateway example: vector addition, there are plenty of explanations online for this. Here, I provide an example code with cutedsl, CUDA has a broader example ecosystem with youtube videos and blog post explanations than cutedsl, but cutedsl is essentially a wrapper of CUDA/PTX.
+- After familiar with simple vector addition, it's time to get to understand how to perform General Matrix Multiplication (GEMM) in a parallel fashion (example a1 [tidx, tidy, _ = cute.arch.thread_idx()](https://github.com/luongthecong123/learn-cutedsl/blob/ec53c071e588d166af25f1f3e6f679f798da42b0/cutedsl/a1_naive_cuda_like.py#L31)), then using shared memory to speed it up (example a2).
 - Next, usage of warp matrix multiplication addition (WMMA) with tensor core, there are great blogs from Lei Mao that provides example as well as great explanation https://leimao.github.io/blog/NVIDIA-Tensor-Core-Programming/ . In CUDA, b1, wmma apis are used to simplify tensor core programming, but in cutedsl or cutlass cute, the consensus is to provide a wrapper on ptx instructions, hence lower level than the CUDA C++ counterpart when it comes to tensor core programming.
+- Then we can move from Ampere to Hopper GPU with Tensor Memory Accelerator (TMA) and Warp Group Matrix Multiply Addition (WGMMA) tensor core, and new barrier instructions for Asynchronous Pipelining introduced in Hopper (a true async chip).
+- Then Blackwell is the next step. (And potentially Vera Rubin...)
+
+# CuTeDSL fundamentals
+
+## Linear indexing
+
+When performing matrix multiplication, we can do something like A[i, j] * B[j, k] = C[i, k]. Which perform 2-D indexing, but the physical memory pointer offset is 1-D, what C++ does under the hood is to convert this to linear offset. When we write CUDA kernel, we pass just the pointer to the first element of the memory block in VRAM to the kernel (pass as reference) so we C++ doesn't create a copy of that parameter when we call the function.
+
+## Host code and device code
+
+API:
+
+@cute.jit is the decorator of the host code function, it will call our device code
+
+@cute.kernel is the decorator for the kernel code
+
+Compilation: you can call the function in just in time (JIT) fashion or you can compiled it and store to a cache folder to be reused the next time the function is called with ahead of time (AOT) compilation
+
+## Interfacing with Pytorch
+
+Pytorch calls to under the hood CUDA kernels, and its tensors on GPU are just pieces of memory/data block that is sliced with pytorch's pointers. So we can use dlpack to grant access to these memory block to run custom kernels on it.
+If you write code in CUDA C++, you need glue code (point to the gluecode.cu) to connect it with pytorch, here this code used separation of cuda source and pytorch source for faster compilation through removing duplicated compilation, based on the benchmarking done by Lei Wang https://github.com/LeiWang1999/CPPTorchExecutable 
+
+cutedsl and other DSLs in general, removed this boilerplate with MLIR and NVVM, so that the compilation time is faster
+
+## Layout
+Arguebly the most important concept in CUTLASS CuTe/CuTeDSL.
+
+API: 
+
+Layout
+
+TV Layout
+
+Swizzle composed Layout
+
+Indexing from layout
+
+## Shared memory
+
+API:
+
+Shared memory allocation
+
+## Atom
+
+API:
+
+Copy atom
+
+Universal copy atom
+
+TMA copy atom
+
+Tiled copy atom
+
+MMA atom
+
+Universal MMA atom
+
+WMMA atom
+
+WGMMA atom
+
+Tcgen05 atom (TODO)
+
+Tiled mma atom
+
+Thr_mma
 
 # Thread-register to mn coordinate mapping and layer fusion optimization
 In CUDA optimization, one can choose to optimize a specific operation like GEMM to speed of light, which is more tedious and time-consuming. Or one can choose to optimize ...
@@ -89,19 +160,6 @@ Since producer and consumer warps operate independently, we need a mechanism for
 - The consumer needs to signal: *"I'm done reading, this slot is free to overwrite"*
 
 To achieve this, we store **`mbarrier`** (barrier) objects in **shared memory**, which is accessible by all threads within a thread block. Each pipeline stage gets its own barrier, and the stages are organized as a **circular buffer** — when we reach the last stage, we wrap back to stage 0.
-
-```
-Shared Memory
-┌──────────────────────────────────────────────────┐
-│  mbarrier[0]   mbarrier[1]   ...   mbarrier[S-1]│  ← one per stage
-├──────────────────────────────────────────────────┤
-│  smem_buf[0]   smem_buf[1]   ...   smem_buf[S-1]│  ← data buffers
-└──────────────────────────────────────────────────┘
-
-Producer cycles:  buf[0] → buf[1] → ... → buf[S-1] → buf[0] → ...
-Consumer cycles:  buf[0] → buf[1] → ... → buf[S-1] → buf[0] → ...
-                  (trails behind producer by up to S stages)
-```
 
 Each barrier tracks a **phase** that flips between even and odd. The producer and consumer agree on which phase means "full" (data ready) and which means "empty" (slot free). A barrier completes and advances its phase when the expected number of arrivals is reached. This is what prevents the two fundamental race conditions:
 
@@ -161,6 +219,8 @@ To take advantage of new async hardware accelerators like TMA and WGMMA, new bar
 | `warpgroup.fence()`          | Ensures prior memory operations are ordered before WGMMA          |
 | `warpgroup.commit_group()`   | Seals all WGMMA instructions issued since the last commit into one group |
 | `warpgroup.wait_group(N)`    | Blocks until at most `N` committed groups are still in flight     |
+
+`commit_group()` help group a bunch of WGMMA calls into 1 call. For example, we want WGMMA to process 16 elements in K dimension (WGMMA_K = 16), but the tile shape in the K dimension is 64 (BK = 64), meaning we have to iterate 4 times through this BK dimension. And finally, `commit_group()` help us group these 4 consecutive WGMMA instructions into one group.
 
 Calling `wait_group(1)` means: *"the group I just committed can still be running, but the group from the previous iteration must be done."* This allows one WGMMA group to overlap with pipeline housekeeping (release, wait, acquire) for the next stage — which is critical for hiding Tensor Core latency.
 
@@ -238,8 +298,8 @@ Producer (Warpgroup 0)               Consumer (Warpgroup 1)
       ├─ producer_acquire(S)                │
       │   (wait for consumer_release)       │
       │                                     │
-      ├─ TMA copy A → smem[S]              │
-      ├─ TMA copy B → smem[S]              │
+      ├─ TMA copy A → smem[S]               │
+      ├─ TMA copy B → smem[S]               │
       │   (tied to barrier via tma_bar_ptr) │
       │                                     │
       ├─ producer_commit(S) [NOP]           │
@@ -281,9 +341,14 @@ For the full SM120 implementation, readers can refer to [Junkai Wu's dense_gemm 
 
 To know if our async pipeline is actually doing overlapping, we need to be able to measure them. Take inspiration from gau-nernst's blog post, I re-implemented his probing code in cutedsl, which requires the usage of inline ptx to call a globaltimer instruction with returns the current clock time.
 
+<p align="center">
+  <img src="./assets/a2_pipeline_profile.png" width="600"><br>
+  <em>Figure 1: Naive CUDA-like kernel execution flow.</em>
+</p>
+
 # Blackwell tcgen05 matrix multiplication
 
-Blackwell provides a new tensor core instruction, which doesn't need ...
+TODO
 
 # Reference:
 1. https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL
@@ -292,3 +357,5 @@ Blackwell provides a new tensor core instruction, which doesn't need ...
 4. https://research.colfax-intl.com/cutlass-tutorial-wgmma-hopper/
 5. https://gau-nernst.github.io/tcgen05/
 6. https://hazyresearch.stanford.edu/blog/2026-02-19-tk-2
+7. https://github.com/LeiWang1999/CPPTorchExecutable
+8. https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/overview.html

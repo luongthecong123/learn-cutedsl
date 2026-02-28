@@ -339,12 +339,6 @@ class Gemm_TC:
             
             cute.arch.sync_threads()
 
-        copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
-            self.c_layout,
-            elem_ty_d=self.c_dtype,
-            elem_ty_acc=cutlass.Float32,
-        )
-
         copy_atom_C = cute.make_copy_atom(
             cute.nvgpu.warp.StMatrix8x8x16bOp(
                 transpose=False,
@@ -356,11 +350,15 @@ class Gemm_TC:
         tiled_copy_r2s_C = cute.make_tiled_copy_C(copy_atom_C, tiled_mma)
 
         thr_copy_stmatrix_C = tiled_copy_r2s_C.get_slice(tid)
-        tCsC_copy_view = thr_copy_stmatrix_C.retile(tCrA)
+        tCrC_copy_view = thr_copy_stmatrix_C.retile(tCrC)
+        tCsC_copy_view = thr_copy_stmatrix_C.partition_D(sC)
         
-        tCsB_copy_view = thr_copy_ldmatrix_B.partition_S(sB_mma)
-        tCrB_copy_view = thr_copy_ldmatrix_B.retile(tCrB)
-
+        cute.copy(
+            atom=tiled_copy_r2s_C,
+            src=tCrC_copy_view,
+            dst=tCsC_copy_view
+        )
+        
         # tv_layout_C_tiled = tiled_mma.tv_layout_C_tiled
 
         # for reg_idx in range(cute.size(tCrC)):
