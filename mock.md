@@ -1,12 +1,6 @@
 # learn-cutedsl
 
-> Adding hardware features and optimization techniques brick by brick and measure the FLOPS speed up.
-
-[![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python)](https://python.org)
-[![CUDA](https://img.shields.io/badge/CUDA-12.x-green?logo=nvidia)](https://developer.nvidia.com/cuda-toolkit)
-[![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
-
----
+Adding hardware features and optimization techniques brick by brick and measure the FLOPS speed up.
 
 ## Overview
 
