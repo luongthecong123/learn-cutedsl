@@ -346,18 +346,11 @@ We split work by **role** rather than by data:
 - **Producer warps** — handle memory (GMEM → SMEM)
 - **Consumer warps** — handle computation (MMA on registers or WGMMA from SMEM)
 
-Different warps can take entirely different code paths with zero divergence penalty because they are independently scheduled by the GPU. This is called **warp specialization**.
-
-```python
-if warp_group_idx == 0:    # Producer warps — handle memory
-    ...
-if warp_group_idx == 1:    # Consumer warps — handle computation
-    ...
-```
+Different warps can take entirely different code paths with zero divergence penalty because they are independently scheduled by the warp scheduler. By doing this, we can overlap the computation done by the consumer with the SMEM filling of the producer. This technique is called **warp specialization**.
 
 ### Pipeline Communication via Barriers in Shared Memory
 
-Producer and consumer warps communicate via **`mbarrier`** objects stored in shared memory (visible to all threads in a block). Each pipeline stage gets its own barrier, organized as a **circular buffer** — after the last stage we wrap back to stage 0.
+Producer and consumer warps communicate via **`mbarrier`** objects stored in shared memory (visible to all threads in a block), which acts as a communication channel for different warps so they can signal each other when data is ready to be consumed or when the data on that smem parition is consumed and ready to be filled with new data. Each pipeline stage gets its own barrier, organized as a **circular buffer** — after the last stage we wrap back to stage 0.
 
 Each barrier tracks a **phase** that alternates between even and odd. The two race conditions that barriers prevent:
 
@@ -398,29 +391,100 @@ for k in range(K):
 
 Used on Hopper when both the producer (TMA) and consumer (WGMMA) are asynchronous. Two complementary mechanisms track completion:
 
-- **TMA completion**: tracked via **transaction byte counting** on barriers. The `tx_count` parameter tells the pipeline how many bytes to expect per stage. TMA hardware automatically decrements the barrier's counter as bytes land in SMEM — `producer_commit()` is a NOP.
-- **WGMMA completion**: tracked via `commit_group()` / `wait_group()` as described above.
+- **TMA completion**: tracked via **transaction byte counting** on barriers. The `tx_count` parameter tells the pipeline how many bytes to expect per stage. TMA hardware automatically decrements the barrier's counter as bytes land in SMEM — `producer_commit()` is effectively a NOP.
+- **WGMMA completion**: tracked via `commit_group()` / `wait_group()` as described in Section 4.
 
-Because the consumer must wait for WGMMA to finish reading before releasing a stage, it uses **two separate state trackers**: `consumer_read_state` and `consumer_release_state`.
+Because the consumer must wait for WGMMA to finish reading SMEM before it is safe to release a stage for the producer to overwrite, it needs **two separate state trackers**: `consumer_read_state` (advances when data is ready to consume) and `consumer_release_state` (advances after WGMMA finishes reading).
 
 The producer uses a **prefetch phase** to fill all `S` pipeline stages before the steady-state loop, maximizing overlap:
 
+```python
+# Setup
+tma_transaction_bytes = cute.size_in_bytes(a_dtype, a_smem_layout) \
+                      + cute.size_in_bytes(b_dtype, b_smem_layout)
+
+pipeline = PipelineTmaAsync.create(
+    num_stages=S,
+    producer_group=CooperativeGroup(Agent.Thread, num_tma_warps),
+    consumer_group=CooperativeGroup(Agent.Thread, num_mma_warps),
+    barrier_storage=mbar_ptr,
+    tx_count=tma_transaction_bytes,   # bytes TMA hw will write per stage
+    cta_layout_vmnk=cute.make_layout((1, *cluster_shape)),
+)
+
+producer_state       = make_pipeline_state(PipelineUserType.Producer, S)
+consumer_read_state  = make_pipeline_state(PipelineUserType.Consumer, S)
+consumer_release_state = make_pipeline_state(PipelineUserType.Consumer, S)
+
+# ── TMA warp (producer) ────────────────────────────────────────────────────
+if is_tma_warp:
+    # Prefetch: eagerly fill all S stages before consumer starts
+    for kidx in range(S):
+        pipeline.producer_acquire(producer_state)            # wait until stage is free
+
+        bar = pipeline.producer_get_barrier(producer_state)
+        cute.copy(tma_atom_a, tAgA[None, producer_state.count],
+                  tAsA[None, producer_state.index], tma_bar_ptr=bar)
+        # Same for sB
+
+        pipeline.producer_commit(producer_state)             # NOP — TMA hw signals via tx_count
+        producer_state.advance()
+
+    # Steady-state: produce remaining K tiles
+    for kidx in range(S, K // BK):
+        pipeline.producer_acquire(producer_state)
+
+        bar = pipeline.producer_get_barrier(producer_state)
+        cute.copy(tma_atom_a, tAgA[None, producer_state.count],
+                  tAsA[None, producer_state.index], tma_bar_ptr=bar)
+        # Same for sB
+
+        pipeline.producer_commit(producer_state)
+        producer_state.advance()
+
+# ── MMA warps (consumer) ───────────────────────────────────────────────────
+if is_mma_warp:
+    tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False) # Set to False before first MMA
+
+    for kidx in range(K // BK):
+        pipeline.consumer_wait(consumer_read_state)          # wait for tx_count to hit 0
+
+        cute.nvgpu.warpgroup.fence()
+
+        for k_block_idx in range(num_k_blocks):              # loop over K sub-tiles
+            cute.gemm(
+                tiled_mma,
+                accumulators,
+                tCrA[None, None, k_block_idx, consumer_read_state.index],
+                tCrB[None, None, k_block_idx, consumer_read_state.index],
+                accumulators,
+            )   
+            tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+
+        cute.nvgpu.warpgroup.commit_group()                  # seal all WGMMA into one group
+        cute.nvgpu.warpgroup.wait_group(0)                   # wait until group finishes
+
+        pipeline.consumer_release(consumer_release_state)    # signal stage is free
+        consumer_read_state.advance()
+        consumer_release_state.advance()
 ```
-Stage S lifecycle
-─────────────────
-Producer (TMA warp)                  Consumer (MMA warps)
-      │                                     │
-      ├─ producer_acquire(S)                │
-      ├─ TMA copy A/B → smem[S]            │
-      │   (tied to barrier via tma_bar_ptr) │
-      ├─ producer_commit(S) [NOP]           │
-      │    TMA hw decrements tx_count       │
-      │         tx_count hits 0 ──────►     ├─ consumer_wait(S) unblocks
-      │                                     ├─ warpgroup.fence()
-      │                                     ├─ WGMMA reads smem[S] (async)
-      │                                     ├─ warpgroup.commit_group() → G_k
-      │                                     ├─ warpgroup.wait_group(0)
-      │  ◄──────────────────────────────────├─ consumer_release(S)
+
+```
+Stage lifecycle
+───────────────
+TMA warp (producer)                   MMA warps (consumer)
+      │                                      │
+      ├─ producer_acquire()                  │
+      ├─ TMA copy A/B → sA/sB[stage]         │
+      │    hw writes bytes, decrements       │
+      │    tx_count on barrier               │
+      ├─ producer_commit()  [NOP]            │
+      │    tx_count hits 0 ─────────────►    ├─ consumer_wait() unblocks
+      │                                      ├─ warpgroup.fence()
+      │                                      ├─ WGMMA reads sA/sB (async)
+      │                                      ├─ commit_group() → seals group
+      │                                      ├─ wait_group(0)  → MMA done
+      │  ◄───────────────────────────────────├─ consumer_release()
 ```
 
 ### What About SM120 (Blackwell RTX)?

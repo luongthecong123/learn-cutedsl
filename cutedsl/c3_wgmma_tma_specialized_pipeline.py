@@ -365,17 +365,13 @@ class Gemm_TC:
                 cute.nvgpu.warpgroup.fence()
 
                 for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
-                    k_block_coord = (None, None, k_block_idx, consumer_read_state.index)
-                    tCrA_k = tCrA[k_block_coord]
-                    tCrB_k = tCrB[k_block_coord]
-
                     cute.gemm(
                         tiled_mma,
                         accumulators,
-                        tCrA_k,
-                        tCrB_k,
+                        tCrA[None, None, k_block_idx, consumer_read_state.index],
+                        tCrB[None, None, k_block_idx, consumer_read_state.index],
                         accumulators,
-                    )
+                    )                    
                     tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
 
                 cute.nvgpu.warpgroup.commit_group()
