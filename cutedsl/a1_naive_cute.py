@@ -73,7 +73,7 @@ def gemm_kernel(gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor):
     tCgC.store(tCrC.load())
 
 def main():
-    M, N, K = 128, 128, 128
+    M, N, K = 1024, 1024, 1024
 
     A = torch.randn((M, K), device="cuda", dtype=torch.float16)
     B = torch.randn((N, K), device="cuda", dtype=torch.float16)
