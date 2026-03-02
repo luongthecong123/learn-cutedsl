@@ -501,26 +501,28 @@ See [Junkai Wu's dense_gemm SM120 example](https://github.com/NVIDIA/cutlass/blo
 </details>
 
 <details>
-<summary><strong>6. Profiling Async Pipelines with Probing</strong></summary>
+<summary><strong>6. Profiling Async Pipelines with Inline PTX Probing</strong></summary>
 
 To verify that our async pipeline is actually overlapping memory and compute, we need timing measurements inside the kernel. Taking inspiration from [gau-nernst's blog post](https://gau-nernst.github.io/tcgen05/), the probing technique uses **inline PTX** to call the `globaltimer` instruction, which returns the current GPU clock in nanoseconds.
 
-CuTeDSL exposes this via `cute.arch.inline_ptx`, which lets you embed raw PTX instructions directly in Python kernel code:
+CuTeDSL exposes this via LLVM IR, which lets you embed raw PTX instructions directly in Python kernel code:
 
 ```python
-# Read GPU nanosecond clock — wraps the PTX: mov.u64 %0, %globaltimer;
-clock = cute.Integer(cute.UInt64(0))
-cute.arch.inline_ptx(
-    "mov.u64 $0, %globaltimer;",
-    outputs=[clock],
-    inputs=[],
-)
-```
+from cutlass.cutlass_dsl import dsl_user_op, T
+from cutlass._mlir.dialects import llvm
 
-Alternatively, if the CuTeDSL version provides it as a built-in:
-
-```python
-clock = cute.arch.read_clock()   # shorthand wrapping the same PTX
+@dsl_user_op
+def globaltimer_u64(*, loc=None, ip=None) -> cutlass.Int64:
+    t = llvm.inline_asm(
+        T.i64(), [],
+        "mov.u64 $0, %globaltimer;",
+        "=l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc, ip=ip,
+    )
+    return cutlass.Int64(t)
 ```
 
 Each warp records timestamps at the start and end of its producer (TMA load) or consumer (WGMMA / MMA) work. The timestamps are written to a small global memory buffer, then post-processed on the CPU and visualized on [Perfetto](https://ui.perfetto.dev).
