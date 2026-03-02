@@ -58,59 +58,185 @@ CuTeDSL and CUDA in general have a very steep but rewarding learning curve, so d
 
 When performing matrix multiplication we write `A[i, j] * B[j, k] = C[i, k]`, which uses 2-D indexing. Physical GPU memory is flat (1-D), so under the hood this multi-dimensional index is collapsed to a single pointer offset. In CUDA kernels we pass only a pointer to the first element of each memory block — no copies are made. CuTe's **Layout** abstraction makes this index arithmetic explicit and composable.
 
+---
+
 ### Host Code vs. Device Code
 
-| Decorator | Role |
-|---|---|
-| `@cute.jit` | Host-side entry point — calls into device code |
-| `@cute.kernel` | Device-side kernel — runs on the GPU |
+```python
+@cute.jit   # host-side entry point
+def my_launcher(mA: cute.Tensor, ...):
+    my_kernel(...).launch(grid=[...], block=[...])
 
-Compilation can be done in **JIT** (just-in-time, compiled on first call) or **AOT** (ahead-of-time, compiled once and cached) mode.
+@cute.kernel   # device-side kernel — runs on the GPU
+def my_kernel(...):
+    ...
+```
+
+- **[`@cute.jit`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a0_vector_addition.py#L11)** marks the host function. It triggers JIT compilation when first called and handles argument marshalling. You can also call `cute.compile(fn, *sample_args)` explicitly for **AOT** (ahead-of-time) compilation, which compiles once and caches the result for reuse — as done in the [`main()` of every script](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a0_vector_addition.py#L47).
+
+- **[`@cute.kernel`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a0_vector_addition.py#L21)** marks the GPU kernel. Inside it, thread/block coordinates are queried with:
+  ```python
+  bidx, bidy, _ = cute.arch.block_idx()
+  bdimx, bdimy, _ = cute.arch.block_dim()
+  tidx, tidy, _ = cute.arch.thread_idx()
+  ```
+
+---
 
 ### Interfacing with PyTorch
 
-PyTorch tensors on the GPU are simply pointers into VRAM with metadata. We use **DLPack** to hand these pointers to our custom CuTeDSL kernels without copying data. In classic CUDA C++ you need glue code (see `cuda/glue_code.cu`) to bridge PyTorch and the kernel; CuTeDSL removes this boilerplate via MLIR/NVVM, resulting in faster compilation.
+```python
+from cutlass.cute.runtime import from_dlpack
+
+A_ = from_dlpack(A, assumed_align=16)   # wrap a torch.Tensor as a cute.Tensor
+```
+
+PyTorch tensors on the GPU are pointers into VRAM with metadata. **[`from_dlpack`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a0_vector_addition.py#L43)** uses the DLPack protocol to share that pointer with CuTeDSL without copying data. No glue code (like `cuda/glue_code.cu`) is needed — CuTeDSL handles the bridge via MLIR/NVVM, making compilation much faster than traditional CUDA C++ extension workflows.
+
+---
 
 ### Layout
 
-Arguably the most important concept in CUTLASS CuTe / CuTeDSL. A `Layout` pairs a **shape** (extents) with a **stride** (step sizes in linear memory). Layouts compose: you can tile, partition, and swizzle them algebraically. Key API surface:
+Arguably the most important concept in CUTLASS CuTe / CuTeDSL. A `Layout` pairs a **shape** (extents in each dimension) with a **stride** (step size in linear memory per dimension). For example, a row-major 4×8 matrix has `shape=(4,8), stride=(8,1)` — moving one row down jumps 8 elements in memory.
 
-- `cute.make_layout(shape, stride)` — construct a layout
-- `cute.idx2crd(idx, shape)` — unflatten a linear index to coordinates
-- `cute.crd2idx(coord, layout)` — flatten coordinates back to a linear index
-- **TV Layout** — maps (Thread, Value/Register) pairs to (M, N) coordinates for tensor core fragments (see `z1_tv2mn.py`)
-- **Swizzle-composed Layout** — eliminates shared memory bank conflicts by XOR-permuting the address mapping (see `a2_smem_cuda_swizzled.py`, `c3_wgmma_tma_specialized_pipeline.py`)
+**Construction:**
+```python
+# cute.make_layout(shape, stride)
+layout = cute.make_layout((BM, BK), stride=(BK + PAD, 1))
+```
+*Used in [`a2_smem_cuda_like.py` L32](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a2_smem_cuda_like.py#L32) to define padded shared memory layouts that avoid bank conflicts.*
+
+**Index arithmetic:**
+```python
+# Flatten multi-dim coordinate → linear offset
+offset = cute.crd2idx(coord, layout)
+
+# Unflatten linear index → coordinate
+coord = cute.idx2crd(idx, shape)
+```
+*Used in [`z1_tv2mn.py` L16–L25](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/z1_tv2mn.py#L16) to decode thread/register indices into logical (m, n) output coordinates.*
+
+**Tiling a global tensor into CTA-sized tiles:**
+```python
+# cute.local_tile(tensor, tiler, coord, proj)
+# Returns the sub-tile of `tensor` that this CTA is responsible for.
+gA_tile = cute.local_tile(gA, tiler=tiler, coord=coord, proj=(1, None, 1))
+```
+*Used in [`a1_naive_cute.py` L30](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute.py#L30). `proj` masks out dimensions so the tile retains the K-iteration axis.*
+
+**Swizzle-composed Layout:**
+
+Bank conflicts occur when multiple threads in a warp access different addresses that map to the same shared memory bank. A **Swizzle** applies an XOR permutation to the row address, spreading accesses across banks. `make_swizzle(B, M, S)` defines the XOR pattern via three bit-field parameters.
+
+```python
+# cute.make_swizzle(B, M, S) — XOR permutation parameters
+# cute.make_composed_layout(inner=swizzle, offset=0, outer=base_layout)
+layout_sA_swizzled = cute.make_composed_layout(
+    inner=cute.make_swizzle(3, 4, 3),
+    offset=0,
+    outer=layout_sA
+)
+```
+*Used in [`a2_smem_cuda_swizzled.py` L35–L39](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a2_smem_cuda_swizzled.py#L35). See [`z0_swizzle.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/z0_swizzle.py#L7) for a standalone swizzle demo.*
+
+---
 
 ### Shared Memory
 
-Shared memory (SMEM) is an on-chip scratchpad shared by all threads in a block — roughly 100× lower latency than global memory. Allocation in CuTeDSL:
+Shared memory (SMEM) is an on-chip scratchpad shared by all threads in a block — roughly 100× lower latency than global memory. In CuTeDSL, SMEM is allocated with:
 
 ```python
-smem_buf = cute.shared_memory(dtype, shape, alignment=128)
+# cutlass.utils.SmemAllocator — manages a contiguous SMEM buffer
+# .allocate_tensor(dtype, layout, alignment, init) → cute.Tensor backed by SMEM
+allocator = cutlass.utils.SmemAllocator()
+sA = allocator.allocate_tensor(cutlass.Float16, layout_sA, 16, None)
 ```
+*Used in [`a2_smem_cuda_like.py` L31–L35](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a2_smem_cuda_like.py#L31).*
 
-Threads cooperatively load tiles from global memory into SMEM, synchronize with `cute.arch.syncthreads()` (or barriers for async), then each thread reads from SMEM rather than GMEM.
+After cooperatively loading a tile from global memory into SMEM, threads must synchronize before reading:
+
+```python
+cute.arch.sync_threads()   # equivalent to __syncthreads() in CUDA C++
+```
+*Used in [`a2_smem_cuda_like.py` L58](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a2_smem_cuda_like.py#L58). For async pipelines (TMA), `mbarrier`-based synchronization replaces this — see Section 6.*
+
+---
 
 ### Copy Atom
 
-A **Copy Atom** describes a single hardware copy instruction (e.g., `cp.async`, TMA, `ldmatrix`). A **Tiled Copy Atom** tiles this atom across all threads in a block to fill a shared memory tile efficiently.
+A **Copy Atom** is the smallest unit of a hardware copy operation. A **Tiled Copy** wraps the atom and distributes the work across all threads in a CTA to fill or drain a tile efficiently.
 
-| Atom type | Notes |
-|---|---|
-| Universal Copy Atom | Generic register ↔ register or GMEM → register copy |
-| `cp.async` atom | Async GMEM → SMEM without going through registers |
-| TMA Copy Atom | Hardware-accelerated GMEM → SMEM, Hopper+ only |
-| `ldmatrix` atom | SMEM → register in the layout expected by tensor core |
+```python
+# cute.make_copy_atom(op, dtype, num_bits_per_copy) → CopyAtom
+# cute.make_tiled_copy(atom, thread_layout, value_layout) → TiledCopy
+atom_copy_A = cute.make_copy_atom(
+    cute.nvgpu.CopyUniversalOp(),
+    mA.element_type,
+    num_bits_per_copy=mA.element_type.width * num_vectorized   # vectorized load
+)
+```
+*Used in [`b2_wmma_smem.py` L63–L67](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b2_wmma_smem.py#L63) for GMEM → SMEM copies with vectorization.*
+
+Once you have a `TiledCopy`, you slice it per-thread and partition source/destination tensors:
+
+```python
+thr_copy = tiled_copy.get_slice(tid)        # per-thread view of the tiled copy
+tAsA = thr_copy.partition_S(sA)             # source partition (this thread's slice of sA)
+tAgA = thr_copy.partition_D(gA)             # destination partition (this thread's slice of gA)
+cute.copy(tiled_copy, tAgA, tAsA)           # every thread copies its own subtensor
+```
+
+> **Naming convention** — the prefix encodes both the partitioner and the tensor. `tAsA` is read as *"partitioning pattern `tA` applied to tensor `sA`"*. The same partitioner `tA` is applied to both `sA` (shared memory) and `gA` (global memory) to produce `tAsA` and `tAgA`. Because both tensors use *the same* partitioning pattern, CuTe can assert that corresponding logical elements match across the two tensors, even if their physical data layouts differ. When you later write `cute.copy(tiled_copy, tAgA, tAsA)`, you can lexically verify that source and destination are partitioned consistently — a naming convention borrowed directly from CUTLASS CuTe C++. The prefix letter also encodes the memory space: `s` = shared memory, `g` = global memory, `r` = register.
+
+| Copy Op | Direction | Notes |
+|---|---|---|
+| `CopyUniversalOp` | any | Generic register-to-register or GMEM → register |
+| `LdMatrix8x8x16bOp` | SMEM → register | `ldmatrix` instruction; loads data in the exact layout tensor cores expect. Used in [`b2_wmma_smem.py` L156–L161](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b2_wmma_smem.py#L156) |
+| `CopyBulkTensorTileG2SOp` | GMEM → SMEM | TMA async load, Hopper+. Used in [`c1_wgmma_tma_load_store.py` L424](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c1_wgmma_tma_load_store.py#L424) |
+| `CopyBulkTensorTileS2GOp` | SMEM → GMEM | TMA async store. Used in [`c1_wgmma_tma_load_store.py` L92](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c1_wgmma_tma_load_store.py#L92) |
+
+---
 
 ### MMA Atom
 
-An **MMA Atom** wraps a single hardware matrix-multiply instruction. A **Tiled MMA Atom** composes multiple atoms and threads into the larger tile shape your kernel needs.
+An **MMA Atom** wraps a single hardware matrix-multiply-accumulate instruction. A **Tiled MMA** tiles this atom across threads and repeats it to cover a larger output tile.
 
-| Atom type | Notes |
-|---|---|
-| WMMA Atom | `wmma` warp-level MMA, Volta+ |
-| WGMMA Atom | Warp-group async MMA, Hopper SM90 only |
-| tcgen05 Atom | Blackwell SM100/SM120 tensor core instruction |
+```python
+# Define the hardware instruction
+mma_op = cute.nvgpu.warp.MmaF16BF16Op(
+    ab_dtype=cutlass.Float16, acc_dtype=cutlass.Float32, shape_mnk=(16, 8, 16))
+
+# Tile it: atom_layout_mnk=(4,4,1) means 4×4 warp-level tiles → 512 threads
+tiled_mma = cute.make_tiled_mma(
+    op_or_atom=mma_op,
+    atom_layout_mnk=(4, 4, 1),
+    permutation_mnk=(64, 64, 16))
+```
+*Used in [`b2_wmma_smem.py` L36–L53](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b2_wmma_smem.py#L36).*
+
+Once you have a `TiledMma`, slice it per-thread and partition the operand tiles:
+
+```python
+thr_mma = tiled_mma.get_slice(tid)    # per-thread view
+tCsA = thr_mma.partition_A(sA)        # A operand partition for this thread (partitioner tC, tensor sA)
+tCsB = thr_mma.partition_B(sB)        # B operand partition (partitioner tC, tensor sB)
+tCgC = thr_mma.partition_C(gC)        # C accumulator partition (partitioner tC, tensor gC)
+
+tCrC = tiled_mma.make_fragment_C(tCgC)   # allocate register fragment for C
+tCrC.fill(cute.Float32(0))
+
+cute.gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC)   # issue MMA
+```
+
+> **Naming convention** — the same `tC` partitioner (derived from `thr_mma`) is applied to `sA`, `sB`, and `gC` to produce `tCsA`, `tCsB`, and `tCgC`. This is the *math partitioning* counterpart of the copy partitioning above. Because `tCsA` and `tAgA` use *different* partitioners (`tC` vs `tA`), they cannot be passed directly to `cute.copy` — you first need to `retile` the copy view to match the MMA layout, as done with `thr_copy_ldmatrix.retile(tCrA)` in [`b2_wmma_smem.py` L171](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b2_wmma_smem.py#L171).
+*Used in [`a1_naive_cute.py` L43–L44](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute.py#L43) and [`b2_wmma_smem.py` L143–L147](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b2_wmma_smem.py#L143).*
+
+| MMA Op | GPU | Notes |
+|---|---|---|
+| `MmaUniversalOp` | all | Scalar FMA tiled to any shape — used for naïve cute GEMM in [`a1_naive_cute.py` L37](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute.py#L37) |
+| `MmaF16BF16Op` (warp) | Ampere+ | `wmma`-style warp-level MMA — used in [`b2_wmma_smem.py` L36](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b2_wmma_smem.py#L36) |
+| WGMMA atom | Hopper SM90 | Warp-group async MMA reading operands from SMEM — used in [`c1_wgmma_tma_load_store.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c1_wgmma_tma_load_store.py) |
+| tcgen05 atom | Blackwell SM100 | Next-gen tensor core — used in [`d1_tcgen05_tma.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/d1_tcgen05_tma.py) |
 
 </details>
 
@@ -379,3 +505,4 @@ modal run submit_modal.py
 6. https://hazyresearch.stanford.edu/blog/2026-02-19-tk-2
 7. https://github.com/LeiWang1999/CPPTorchExecutable
 8. https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/overview.html
+9. https://research.colfax-intl.com/cutlass-tutorial-writing-gemm-kernels-using-tensor-memory-for-nvidia-blackwell-gpus/

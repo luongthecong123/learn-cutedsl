@@ -29,14 +29,14 @@ class Gemm_TC:
         self.warp_size = cute.arch.WARP_SIZE
         self.num_threads_per_warp_group = 128
 
-        self.mma_warp_groups = math.prod(self.atom_layout_mnk)
+        self.num_mma_warp_groups = math.prod(self.atom_layout_mnk)
         self.num_tma_warps = 1
-        self.threads_per_cta = self.mma_warp_groups * self.num_threads_per_warp_group + self.warp_size * self.num_tma_warps
+        self.threads_per_cta = self.num_mma_warp_groups * self.num_threads_per_warp_group + self.warp_size * self.num_tma_warps
 
         assert self.BM % 64 == 0, "bM must be divisible by 64 for WGMMA"
         assert self.BN % 64 == 0, "bN must be divisible by 64 for WGMMA"
 
-        self.num_stages = 3
+        self.num_stages = 5
         self.buffer_align_bytes = 1024
         self.cluster_shape_mn = (1, 1)
 
@@ -195,8 +195,8 @@ class Gemm_TC:
 
         # Threads 0-127: MMA warps (warps 0-3)
         # Threads 128-159: TMA warp (warp 4)
-        is_mma_warp = tidx < self.mma_warp_groups * self.num_threads_per_warp_group
-        is_tma_warp = warp_idx // 4 == self.mma_warp_groups
+        is_mma_warp = tidx < self.num_mma_warp_groups * self.num_threads_per_warp_group
+        is_tma_warp = warp_idx // 4 == self.num_mma_warp_groups
 
         if is_tma_warp:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
@@ -273,7 +273,7 @@ class Gemm_TC:
             tidx // self.num_threads_per_warp_group
         )
         warp_group_thread_layout = cute.make_layout(
-            self.mma_warp_groups, stride=self.num_threads_per_warp_group
+            self.num_mma_warp_groups, stride=self.num_threads_per_warp_group
         )
         thr_mma = tiled_mma.get_slice(warp_group_thread_layout(warp_group_idx))
 
@@ -296,11 +296,11 @@ class Gemm_TC:
 
         mbar_ptr = storage.mainloop_pipeline_array_ptr.data_ptr()
 
-        # Pipeline: TMA warp (1 thread) is producer, MMA warps are consumers
-        num_consumer_warps = self.mma_warp_groups * (self.num_threads_per_warp_group // self.warp_size)
+        # Pipeline: TMA warp is producer, MMA warps are consumers
+        num_consumer_warps = self.num_mma_warp_groups * (self.num_threads_per_warp_group // self.warp_size)
         mainloop_pipeline = PipelineTmaAsync.create(
             num_stages=self.num_stages,
-            producer_group=CooperativeGroup(Agent.Thread),
+            producer_group=CooperativeGroup(Agent.Thread, self.num_tma_warps),
             consumer_group=CooperativeGroup(Agent.Thread, num_consumer_warps),
             barrier_storage=mbar_ptr,
             tx_count=tma_transaction_bytes,

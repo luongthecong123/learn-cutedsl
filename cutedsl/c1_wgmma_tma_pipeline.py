@@ -34,7 +34,7 @@ class Gemm_TC:
         assert self.BM % 64 == 0, "bM must be divisible by 64 for WGMMA"
         assert self.BN % 64 == 0, "bN must be divisible by 64 for WGMMA"
 
-        self.num_stages = 3
+        self.num_stages = 5
         self.buffer_align_bytes = 1024
         self.cluster_shape_mn = (1, 1)
         
