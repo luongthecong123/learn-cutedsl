@@ -1,1 +1,0 @@
-In CUDA kernels naive and smem, we still separate the functionalities of threads in the 

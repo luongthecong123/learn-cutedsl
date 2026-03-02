@@ -36,6 +36,8 @@ class Gemm_TC:
         mma_op = cute.nvgpu.warp.MmaF16BF16Op(
             ab_dtype=cutlass.Float16, acc_dtype=cutlass.Float32, shape_mnk=self.mma_inst_shape)
         
+        print(f"[DEBUG GEMM TC] mma_op: {mma_op}")
+
         permutation_mnk = (
             self.atom_layout_mnk[0] * self.mma_inst_shape[0], # 4 * 16 = 64
             # if atom layout's N-mode is 1, to leverage the largest coalesced
@@ -48,6 +50,8 @@ class Gemm_TC:
             op_or_atom=mma_op,
             atom_layout_mnk=self.atom_layout_mnk,
             permutation_mnk=permutation_mnk)
+
+        print(f"[DEBUG GEMM TC] tiled_mma: {tiled_mma}")
         #===============================================
         # SMEM layout
         padding = self._smem_padding

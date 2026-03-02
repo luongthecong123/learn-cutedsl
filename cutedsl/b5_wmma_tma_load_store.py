@@ -339,57 +339,90 @@ class Gemm_TC:
             
             cute.arch.sync_threads()
 
-        copy_atom_C = cute.make_copy_atom(
-            cute.nvgpu.warp.StMatrix8x8x16bOp(
-                transpose=False,
-                num_matrices=4,
-            ),
-            self.c_dtype,
-        )
-
-        tiled_copy_r2s_C = cute.make_tiled_copy_C(copy_atom_C, tiled_mma)
-
-        thr_copy_stmatrix_C = tiled_copy_r2s_C.get_slice(tid)
-        tCrC_copy_view = thr_copy_stmatrix_C.retile(tCrC)
-        tCsC_copy_view = thr_copy_stmatrix_C.partition_D(sC)
+        # ========== Option 1 ================
+        # Use StMatrixStore to store from register to smem, then TMA store to gmem
         
-        cute.copy(
-            atom=tiled_copy_r2s_C,
-            src=tCrC_copy_view,
-            dst=tCsC_copy_view
-        )
+        # tCrC_out = cute.make_fragment_like(tCrC, dtype=cutlass.Float16)
+        
+        # for reg_idx in range(cute.size(tCrC_out)):
+        #     tCrC_out[reg_idx] = cutlass.Float16(tCrC[reg_idx])
+
+        # copy_atom_C = cute.make_copy_atom(
+        #     cute.nvgpu.warp.StMatrix8x8x16bOp(
+        #         transpose=False,
+        #         num_matrices=4,
+        #     ),
+        #     self.c_dtype,
+        # )
+
+        # tiled_copy_r2s_C = cute.make_tiled_copy_C(copy_atom_C, tiled_mma)
+
+        # thr_copy_stmatrix_C = tiled_copy_r2s_C.get_slice(tid)
+        # tCrC_copy_view = thr_copy_stmatrix_C.retile(tCrC_out)
+        # tCsC_copy_view = thr_copy_stmatrix_C.partition_D(sC)
+        
+        # cute.copy(
+        #     atom=tiled_copy_r2s_C,
+        #     src=tCrC_copy_view,
+        #     dst=tCsC_copy_view
+        # )
+
+        # ========== Option 2 ================
+        # Use tv_layout to store from register -> smem, then TMA store to gmem
         
         # tv_layout_C_tiled = tiled_mma.tv_layout_C_tiled
-
+        
         # for reg_idx in range(cute.size(tCrC)):
         #     coord = cute.idx2crd((tid, reg_idx), tv_layout_C_tiled.shape)
         #     mn_local_tile_flat = cute.crd2idx(coord, tv_layout_C_tiled)
         #     m_local, n_local = cute.idx2crd(mn_local_tile_flat, c_smem_layout.shape)
         #     sC[m_local, n_local] = cutlass.Float16(tCrC[reg_idx])
         
-        cute.arch.sync_threads()
-        cute.arch.fence_proxy("async.shared", space="cta")
+        ## ========== TMA Store ================
+        ## TMA store from smem to gmem for both option 1 and 2
+
+        # cute.arch.sync_threads()
+        # cute.arch.fence_proxy("async.shared", space="cta")
         
-        gC_tma = cute.local_tile(
-            input=mC_tma_tensor,
-            tiler=self.tile_shape_mnk,
-            coord=(bidx, bidy, None),
-            proj=(1, 1, None)
+        # gC_tma = cute.local_tile(
+        #     input=mC_tma_tensor,
+        #     tiler=self.tile_shape_mnk,
+        #     coord=(bidx, bidy, None),
+        #     proj=(1, 1, None)
+        # )
+        
+        # sC_for_tma_partition = cute.group_modes(sC, 0, 2)
+        # gC_for_tma_partition = cute.group_modes(gC_tma, 0, 2)
+        
+        # tCsC, tCgC_store = cute.nvgpu.cpasync.tma_partition(
+        #     tma_atom_c,
+        #     0,
+        #     cute.make_layout(1),
+        #     sC_for_tma_partition,
+        #     gC_for_tma_partition,
+        # )
+        
+        # if warp_idx == 0:
+        #     cute.copy(tma_atom_c, tCsC, tCgC_store)
+
+        # ========== Option 3 ================
+        # directly store from register to gmem
+        
+        atom_universal = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            mC.element_type 
         )
+
+        tCrC_out = cute.make_fragment_like(tCrC, dtype=cutlass.Float16)
         
-        sC_for_tma_partition = cute.group_modes(sC, 0, 2)
-        gC_for_tma_partition = cute.group_modes(gC_tma, 0, 2)
-        
-        tCsC, tCgC_store = cute.nvgpu.cpasync.tma_partition(
-            tma_atom_c,
-            0,
-            cute.make_layout(1),
-            sC_for_tma_partition,
-            gC_for_tma_partition,
+        for reg_idx in range(cute.size(tCrC_out)):
+            tCrC_out[reg_idx] = cutlass.Float16(tCrC[reg_idx])
+            
+        cute.copy(
+            atom=atom_universal,
+            src=tCrC_out,
+            dst=tCgC
         )
-        
-        if warp_idx == 0:
-            cute.copy(tma_atom_c, tCsC, tCgC_store)
 
     @staticmethod
     def _make_tma_atoms_and_tensors(

@@ -12,7 +12,7 @@ Below are the pros and cons that I observed while learning cutedsl:
 Pros:
 - Provides quality of life apis to help write efficient cuda kernels
 - Easier to learn compared to CUTLASS CuTe C++ counterpart which can be daunting to start learning with its highly templated code
-- Expose low level features for speed of light (SoL) optimization, you can write it the cute way or the cuda/ptx way
+- Expose low level features for speed of light (SoL) optimization, you can write it the cute way or the cuda/ptx way (very versitile)
 - Seamless integration with Pytorch with JIT compilation
 - Blazing fast compilation
 - Faster development cycle thanks to Python 
@@ -20,9 +20,11 @@ Pros:
 - Great SoL examples by Junkai Wu and team
 
 Cons:
-- Too many apis to do the same thing, can be confusing and hard to master
+- Too many apis to do the same thing, can be confusing and hard to master (a trade-off of versibility)
 - Lack detailed documentation on lots of apis
 - Examples are too complicated due to SoL requirements.
+
+In overview, the first section provides beginners with a learning roadmap for becoming familiar with CUDA/CuTeDSL. The second section CuTeDSL Fundametal will explain important/commonly-used APIs, namely: Layout, .... Next ...
 
 Job submission using Ray
 ```bash
@@ -90,6 +92,7 @@ Layout
 TV Layout
 
 Swizzle composed Layout
+Reference to the exact line a2 wizzled and c3 swizzle
 
 Indexing from layout
 
@@ -125,8 +128,94 @@ Tiled mma atom
 
 Thr_mma
 
-# Thread-register to mn coordinate mapping and layer fusion optimization
+# TV Layout for Thread-register to mn coordinate mapping and layer fusion optimization
 In CUDA optimization, one can choose to optimize a specific operation like GEMM to speed of light, which is more tedious and time-consuming. Or one can choose to optimize ...
+
+For example, in a kernel that I wrote to optimize RNN, that managed to speed it up 90-110x over Pytorch, the key is to not materialize the resulted large matC, then perform a GEMV (matrix vector multiplication) afterwards, and save the smaller GEMV result back to global memory, this requires knowing how to map Thread Register of accumulator fragment/register of tensor core op to logical m, n coordinate. [Usage in custom RNN kernel](https://github.com/chongxi/rnn_train_ring_attractor/blob/main/cpp/kernels/fwd_1loop_tc_idx.cuh#L5). Knowing this technique allows aggressive layer fusion that gives more speedup, since we're bypassing round trip global memory reads and writes which are the really slow.
+
+By reading PTX documentation, one can come up with something like this, that uses modulo and integer division to do this mapping
+```c++
+template<int WMMA_M, int WMMA_N, int WMMA_K, typename T>
+__device__ void tv2mn(wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float>& fragC)
+{
+    /*
+    *16x16 FragC Register Layout (4 quadrants, each with 2 registers)
+    *Only support m16n16k16 and m32n8k16.
+
+            +---------+---------+
+            | r0  r1  | r4  r5  |
+    0-7  |         |         |
+            | Block 0 | Block 1 |
+            +---------+---------+
+            | r2  r3  | r6  r7  |
+    8-15 |         |         |
+            | Block 2 | Block 3 |
+            +---------+---------+
+            0-7       8-15
+    */
+
+    constexpr int NUM_REGBLOCK_ROWS = WMMA_M / 8;
+    constexpr int NUM_REGBLOCK_COLS = WMMA_N / 8;
+    constexpr int REGS_PER_BLOCK = 2;
+
+    size_t threadID_in_warp = threadIdx.x % WARPSIZE;
+    size_t groupID_in_warp = threadID_in_warp / 4;
+    size_t threadID_in_group = threadID_in_warp % 4;
+
+    for (int regBlockRow = 0; regBlockRow < NUM_REGBLOCK_ROWS; ++regBlockRow) {
+        for (int regBlockCol = 0; regBlockCol < NUM_REGBLOCK_COLS; ++regBlockCol) {
+            for (int i = 0; i < REGS_PER_BLOCK; ++i) {
+                int regID = (regBlockRow * REGS_PER_BLOCK) +
+                        (regBlockCol * NUM_REGBLOCK_ROWS * REGS_PER_BLOCK) + i;
+                size_t m = regBlockRow * 8 + groupID_in_warp;
+                size_t n = regBlockCol * 8 + threadID_in_group * 2 + i;
+                // use m, n for indexing
+            }
+        }
+    }
+}
+```
+Cutlass cute provides the formula to calculate these already in the form of atom.
+For example, if we print out the atom and tiled of warp MMA instruction (reference b2 script), we get:
+
+```bash
+mma_op: warp-level F16/BF16 MMA Operation
+  A/B data type         = Float16
+  Accumulator data type = Float32
+  Instruction shape MNK = (16, 8, 16)
+tiled_mma: Tiled MMA
+  Thr Layout VMNK: (32,4,4,1):(1,32,128,0)
+  Permutation MNK: (64:1,64:1,16:1)
+MMA Atom
+  ThrID:           32:1
+  Shape MNK:       (16,8,16)
+  TV Layout A:     ((4,8),(2,2,2)):((32,1),(16,8,128))
+  TV Layout B:     ((4,8),(2,2)):((16,1),(8,64))
+  TV Layout C:     ((4,8),(2,2)):((32,1),(16,8))
+```
+
+In `TV Layout C:     ((4,8),(2,2)):((32,1),(16,8))`, (4,8) has 4*8 = 32 threads, which is the number of threads in a warp, and (2,2) shows that there are 4 32-bit registers per thread are required to store this accumulation fragment. So this is for a single warp, I later tile this atom to 4x4 tiled layout, meaning I will launch 4x4x32 = 512 threads to calculate larger tensor core instruction. The tiled tv layout will be:
+
+```bash
+tv_layout_C_tiled:
+((4,8,4,4),((2,2),(1,2))):((128,1,16,512),((64,8),(0,2048)))
+```
+`(4,8,4,4)` means I have tiled this warp layout to 4x4 shape. And `((2,2),(1,2))` means that now each thread will hold double the number of registers in this particular layout.
+
+`tv_layout_C_tiled` is what we are looking for, it is exactly the function that we used above. And we just have to tap into this function to get the m, n that we need like in the script (reference b5 or b6). For each thread with thread idex (tid), we loop through the its allocated fragC register. 
+
+```python
+for reg_idx in range(cute.size(tCrC_out)):
+    coord = cute.idx2crd((tid, reg_idx), tv_layout_C_tiled.shape)
+    mn_flat = cute.crd2idx(coord, tv_layout_C_tiled)
+    m, n = cute.idx2crd(mn_flat, fragC_layout.shape)
+```
+You can also loop through tv layout C, but the m,n received from that will be local to that warp, and needs to be converted to global m, n.
+
+The first line, we will loop through each registers allocated for this thread for the accumulator. Then we pass the thread index to `(4,8,4,4)` and register index to `((2,2),(1,2))` to unflatten the index back to these shape, for example (reference z1_tv2mn.py), if thread id = 11, and register index = 3, then coord will be `((3, 2, 0, 0), ((1, 1), (0, 0)))`. Next step is to get the value that encodes m, n, printing mn_flat would give us `1547`, and unflatten this will give us the logical m, n coordinate of the value at the 11-th thread and the 3-th register in the accumulator, which is `m=11, n=24`.
+
+Not materialize is also used in Implicit GEMM algorithm that calculate im2col matrix on the fly and load tiles of it to smem, resulted in convolution algorithm that can take advantage of tensor core and smem efficiently.
+
 
 # Tensor Memory Accelerator (TMA)
 
@@ -222,69 +311,112 @@ To take advantage of new async hardware accelerators like TMA and WGMMA, new bar
 
 `commit_group()` help group a bunch of WGMMA calls into 1 call. For example, we want WGMMA to process 16 elements in K dimension (WGMMA_K = 16), but the tile shape in the K dimension is 64 (BK = 64), meaning we have to iterate 4 times through this BK dimension. And finally, `commit_group()` help us group these 4 consecutive WGMMA instructions into one group.
 
-Calling `wait_group(1)` means: *"the group I just committed can still be running, but the group from the previous iteration must be done."* This allows one WGMMA group to overlap with pipeline housekeeping (release, wait, acquire) for the next stage — which is critical for hiding Tensor Core latency.
+Calling `wait_group(0)` means: *"wait until all committed groups are done."* This ensures the stage can be safely released back to the producer since WGMMA has finished reading from shared memory. The wait happens **after** committing the current group but **before** releasing the stage.
 
-Because the consumer releases a stage **one iteration behind** where it reads, it needs **two separate state trackers**: `consumer_read_state` (which stage to read next) and `consumer_release_state` (which stage to release next, lagging behind).
+Since the consumer waits for all groups to complete before releasing, it uses **two separate state trackers**: `consumer_read_state` (which stage to read next) and `consumer_release_state` (which stage to release). Both advance together after the wait completes.
 
 ```python
 # Setup
+num_consumer_warps = mma_warp_groups * (num_threads_per_warp_group // warp_size)
 mainloop_pipeline = PipelineTmaAsync.create(
-    num_stages=S,
-    producer_group=CooperativeGroup(Agent.Thread, 128),
-    consumer_group=CooperativeGroup(Agent.Thread, 128),
+    num_stages=num_stages,
+    producer_group=CooperativeGroup(Agent.Thread),
+    consumer_group=CooperativeGroup(Agent.Thread, num_consumer_warps),
     barrier_storage=mbar_ptr,
-    tx_count=tma_copy_bytes,          # expected bytes per stage — barrier tracks this
-    cta_layout_vmnk=cta_layout_vmnk,
+    tx_count=tma_transaction_bytes,   # expected bytes per stage — barrier tracks this
+    cta_layout_vmnk=cute.make_layout((1, *cta_layout_mnk.shape))
 )
-producer_state = make_pipeline_state(PipelineUserType.Producer, S)
-consumer_read_state = make_pipeline_state(PipelineUserType.Consumer, S)
-consumer_release_state = make_pipeline_state(PipelineUserType.Consumer, S)
+producer_state = make_pipeline_state(PipelineUserType.Producer, num_stages)
+consumer_read_state = make_pipeline_state(PipelineUserType.Consumer, num_stages)
+consumer_release_state = make_pipeline_state(PipelineUserType.Consumer, num_stages)
 ```
 
 ```python
 # Mainloop
 
-# ── Warpgroup 0: Producer (TMA) ───────────────────────
-if warp_group_idx == 0:
-    for k in range(K):
-        mainloop_pipeline.producer_acquire(producer_state)  # wait for stage free
+# ── TMA WARP (producer) ───────────────────────────────
+if is_tma_warp:
+    # Prefetch: fill all pipeline stages
+    for kidx in range(num_stages):
+        mainloop_pipeline.producer_acquire(producer_state)
 
-        cute.copy(tma_atom_a, gA[k], sA[producer_state.index],
-                  tma_bar_ptr=mainloop_pipeline.producer_get_barrier(producer_state),
-                  #           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-                  #           TMA hardware will decrement this barrier's
-                  #           tx_count when bytes land in smem
-                  )
-        cute.copy(tma_atom_b, gB[k], sB[producer_state.index],
-                  tma_bar_ptr=mainloop_pipeline.producer_get_barrier(producer_state),
-                  )
+        cute.copy(
+            tma_atom_a,
+            tAgA[None, producer_state.count],
+            tAsA[None, producer_state.index],
+            tma_bar_ptr=mainloop_pipeline.producer_get_barrier(producer_state)
+            #           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+            #           TMA hardware will decrement this barrier's
+            #           tx_count when bytes land in smem
+        )
+        cute.copy(
+            tma_atom_b,
+            tBgB[None, producer_state.count],
+            tBsB[None, producer_state.index],
+            tma_bar_ptr=mainloop_pipeline.producer_get_barrier(producer_state)
+        )
 
-        mainloop_pipeline.producer_commit(producer_state)   # NOP — TMA signals via
-        producer_state.advance()                            #        tx_count, not threads
+        mainloop_pipeline.producer_commit(producer_state)   # NOP — TMA signals via tx_count
+        producer_state.advance()
 
-# ── Warpgroup 1: Consumer (WGMMA) ─────────────────────
-if warp_group_idx == 1:
-    for k in range(K):
-        mainloop_pipeline.consumer_wait(consumer_read_state)  # wait for tx_count == 0
-                                                              # (TMA bytes all landed)
+    # Continue producing for remaining K tiles
+    for kidx in range(num_stages, k_tile_cnt):
+        mainloop_pipeline.producer_acquire(producer_state)
 
-        cute.nvgpu.warpgroup.fence()                          # order memory before wgmma
+        cute.copy(
+            tma_atom_a,
+            tAgA[None, producer_state.count],
+            tAsA[None, producer_state.index],
+            tma_bar_ptr=mainloop_pipeline.producer_get_barrier(producer_state)
+        )
+        cute.copy(
+            tma_atom_b,
+            tBgB[None, producer_state.count],
+            tBsB[None, producer_state.index],
+            tma_bar_ptr=mainloop_pipeline.producer_get_barrier(producer_state)
+        )
 
-        for kb in range(num_k_blocks):                        # issue wgmma — async,
-            cute.gemm(tiled_mma, acc, sA[...], sB[...], acc)  # returns immediately
+        mainloop_pipeline.producer_commit(producer_state)
+        producer_state.advance()
 
-        cute.nvgpu.warpgroup.commit_group()                   # seal as group G_k
+# ── MMA WARPs (consumer) ──────────────────────────────
+if is_mma_warp:
+    tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
 
-        cute.nvgpu.warpgroup.wait_group(1)                    # wait until G_{k-1} done
-                                                              # (G_k can still be running)
+    for kidx in range(k_tile_cnt):
+        # Wait until TMA bytes for this stage have landed (tx_count == 0)
+        mainloop_pipeline.consumer_wait(consumer_read_state)
 
-        mainloop_pipeline.consumer_release(                   # release stage from G_{k-1}
-            consumer_release_state)                           # safe: wgmma done reading it
+        # Ensure memory ordering before issuing async WGMMA instructions
+        cute.nvgpu.warpgroup.fence()
 
+        # Issue WGMMA blocks (these return immediately)
+        for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
+            # Build the per-k-block fragment coordinates using the consumer state index
+            k_block_coord = (None, None, k_block_idx, consumer_read_state.index)
+            tCrA_k = tCrA[k_block_coord]
+            tCrB_k = tCrB[k_block_coord]
+
+            cute.gemm(
+                tiled_mma,
+                accumulators,
+                tCrA_k,
+                tCrB_k,
+                accumulators,
+            )
+            # Flip accumulate flag after first MMA
+            tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+
+        # Seal the issued WGMMA instructions as one commit group
+        cute.nvgpu.warpgroup.commit_group()
+
+        # Wait until all committed groups are done reading smem
+        cute.nvgpu.warpgroup.wait_group(0)
+
+        # Release the stage now that WGMMA is done reading from it
+        mainloop_pipeline.consumer_release(consumer_release_state)
         consumer_read_state.advance()
         consumer_release_state.advance()
-
-    cute.nvgpu.warpgroup.wait_group(0)                        # drain last group
 ```
 
 The timing of each stage's lifecycle looks like this:
@@ -293,7 +425,7 @@ The timing of each stage's lifecycle looks like this:
                     Stage S lifecycle
                     ─────────────────
 
-Producer (Warpgroup 0)               Consumer (Warpgroup 1)
+Producer (TMA warp)                  Consumer (MMA warps)
       │                                     │
       ├─ producer_acquire(S)                │
       │   (wait for consumer_release)       │
@@ -315,13 +447,18 @@ Producer (Warpgroup 0)               Consumer (Warpgroup 1)
       │                                     ├─ WGMMA reads from smem[S] (async)
       │                                     ├─ warpgroup.commit_group()  → G_k
       │                                     │
-      │                                     ├─ warpgroup.wait_group(1)
-      │                                     │   (confirms G_{k-1} done reading
-      │                                     │    smem[S-1])
+      │                                     ├─ warpgroup.wait_group(0)
+      │                                     │   (confirms all groups done reading)
       │                                     │
-      │  ◄──────────────────────────────────├─ consumer_release(S-1)
+      │  ◄──────────────────────────────────├─ consumer_release(S)
       │                                     │
 ```
+
+**Note**: The producer uses a two-phase approach:
+1. **Prefetch phase**: Fill all `num_stages` pipeline stages (0 to `num_stages-1`)
+2. **Steady state**: Continue producing remaining K tiles while consumer processes
+
+This allows the pipeline to stay full and maximize overlapping of TMA loads with WGMMA compute.
 
 ## What About SM120 (Blackwell RTX)?
 
@@ -339,11 +476,18 @@ For the full SM120 implementation, readers can refer to [Junkai Wu's dense_gemm 
 
 # Profiling asynchronous warp specialization with probing
 
-To know if our async pipeline is actually doing overlapping, we need to be able to measure them. Take inspiration from gau-nernst's blog post, I re-implemented his probing code in cutedsl, which requires the usage of inline ptx to call a globaltimer instruction with returns the current clock time.
+To know if our async pipeline is actually doing overlapping, we need to be able to measure them. Take inspiration from gau-nernst's blog post, I re-implemented his probing code in cutedsl, which requires the usage of inline ptx to call a globaltimer instruction with returns the current clock time. This is just a template example where we launch just 2 warps per block, which is very low in occupancy, and the smem loading is the main bottle neck here, we can speed up gmem -> smem with vectorized load or TMA. And the MMA happens too fast, meaning it's not computing a whole lot, leading to a really low Arithmetic Intensity (computation/bytes-transferred).
 
 <p align="center">
   <img src="./assets/a2_pipeline_profile.png" width="600"><br>
-  <em>Figure 1: Naive CUDA-like kernel execution flow.</em>
+  <em>Figure 1: Profile PipelineAsync.</em>
+</p>
+
+Below is the result of running script c3_wgmma_tma_specialized_pipeline_profile.py and visualize on [perfecto](https://ui.perfetto.dev), we can see the first 3 prefetched TMAs, then the WGMMA are overlapped quite nicely, although there are still launch overheads.
+
+<p align="center">
+  <img src="./assets/c3_pipeline_profile_64x128x64.png" width="600"><br>
+  <em>Figure 2: Profile PipelineTmaAsync.</em>
 </p>
 
 # Blackwell tcgen05 matrix multiplication

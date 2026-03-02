@@ -13,7 +13,7 @@ from cutlass.pipeline import PipelineTmaAsync, CooperativeGroup, Agent, make_pip
 class Gemm_TC:
     def __init__(
         self,
-        cta_tiler: Tuple[int, int, int] = (64, 128, 64),
+        cta_tiler: Tuple[int, int, int] = (128, 128, 64),
     ):
         self.tile_shape_mnk = cta_tiler
         self.BM, self.BN, self.BK = self.tile_shape_mnk
@@ -25,18 +25,16 @@ class Gemm_TC:
         )
 
         self.warp_size = cute.arch.WARP_SIZE
-        self.warp_group_size = 128
+        self.num_threads_per_warp_group = 128
         
+        # No separate TMA warp group: all threads do MMA, warp 0 also handles TMA
         self.mma_warp_groups = math.prod(self.atom_layout_mnk)
-        self.tma_warp_groups = 1
-        self.threads_per_cta = (self.mma_warp_groups + tma_warp_groups) * self.warp_group_size
+        self.threads_per_cta = self.mma_warp_groups * self.num_threads_per_warp_group
         
         assert self.BM % 64 == 0, "bM must be divisible by 64 for WGMMA"
         assert self.BN % 64 == 0, "bN must be divisible by 64 for WGMMA"
 
-        self.num_stages = 1
-        self.num_producer_threads = self.mma_warp_groups * self.warp_group_size
-        self.num_consumer_threads = self.tma_warp_groups * self.warp_group_size       
+        self.num_stages = 3
         self.buffer_align_bytes = 1024
         self.cluster_shape_mn = (1, 1)
         
@@ -181,10 +179,10 @@ class Gemm_TC:
         tidx, _, _ = cute.arch.thread_idx()
         
         warp_group_idx = cute.arch.make_warp_uniform(
-            tidx // self.warp_group_size
+            tidx // self.num_threads_per_warp_group
         )
         warp_group_thread_layout = cute.make_layout(
-            self.mma_warp_groups, stride=self.warp_group_size
+            self.mma_warp_groups, stride=self.num_threads_per_warp_group
         )
         thr_mma = tiled_mma.get_slice(warp_group_thread_layout(warp_group_idx))
 
@@ -271,10 +269,14 @@ class Gemm_TC:
 
         mbar_ptr = storage.mainloop_pipeline_array_ptr.data_ptr()
 
-        mainloop_pipeline - PipelineTmaAsync.create(
+        # Pipeline creation (cooperative model, matches dense_gemm.py)
+        # Producer = warp 0 (issues TMA copies)
+        # Consumer = all warps (participate in consumer_wait/release)
+        num_warps = self.threads_per_cta // self.warp_size
+        mainloop_pipeline = PipelineTmaAsync.create(
             num_stages=self.num_stages,
-            producer_group=CooperativeGroup(Agent.Thread, self.num_producer_threads),
-            consumer_group=CooperativeGroup(Agent.Thread, self.num_consumer_threads),
+            producer_group=CooperativeGroup(Agent.Thread),
+            consumer_group=CooperativeGroup(Agent.Thread, num_warps),
             barrier_storage=mbar_ptr,
             tx_count=tma_transaction_bytes,
             cta_layout_vmnk=cute.make_layout((1, *cta_layout_mnk.shape))
@@ -285,73 +287,103 @@ class Gemm_TC:
         consumer_release_state = make_pipeline_state(PipelineUserType.Consumer, self.num_stages)
 
         k_tile_cnt = mA_tma_tensor.shape[1] // self.BK
-        
-        tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
 
-        # Producer
-        if warp_group_idx == self.num_consumer_threads: 
-            mainloop_pipeline.producer_acquire(producer_state)  # wait for stage free
-            for kidx in range(k_tile_cnt):
+        # =========== PREFETCH: warp 0 fills pipeline stages ===========
+        if warp_idx == 0:
+            for kidx in range(self.num_stages):
+                mainloop_pipeline.producer_acquire(producer_state)
+
                 cute.copy(
                     tma_atom_a,
-                    tAgA[None, kidx],
+                    tAgA[None, producer_state.count],
                     tAsA[None, producer_state.index],
                     tma_bar_ptr=mainloop_pipeline.producer_get_barrier(producer_state)
                 )
-                
                 cute.copy(
                     tma_atom_b,
-                    tBgB[None, kidx],
+                    tBgB[None, producer_state.count],
                     tBsB[None, producer_state.index],
                     tma_bar_ptr=mainloop_pipeline.producer_get_barrier(producer_state)
                 )
 
-                cute.arch.mbarrier_wait(mbar_ptr, 0)
+                mainloop_pipeline.producer_commit(producer_state)
+                producer_state.advance()
 
-        # Consumer
-        if warp_group_idx < self.num_consumer_threads: 
-            for kidx in range(k_tile_cnt):
-                cute.nvgpu.warpgroup.fence()
-                
-                for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
-                    k_block_coord = (None, None, k_block_idx, 0)
-                    tCrA_k = tCrA[k_block_coord]
-                    tCrB_k = tCrB[k_block_coord]
+        # =========== MAINLOOP: all threads consume + warp 0 refills ===========
+        tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
 
-                    cute.gemm(
-                        tiled_mma,
-                        accumulators,
-                        tCrA_k,
-                        tCrB_k,
-                        accumulators,
-                    )
-                    tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
-                
-                cute.nvgpu.warpgroup.commit_group()
-                cute.nvgpu.warpgroup.wait_group(0)
-        
-            tv_layout_C_tiled = tiled_mma.tv_layout_C_tiled
-            
-            for reg_idx in range(cute.size(accumulators)):
-                coord = cute.idx2crd((tidx, reg_idx), tv_layout_C_tiled.shape)
-                mn_local_tile_flat = cute.crd2idx(coord, tv_layout_C_tiled)
-                m_local, n_local = cute.idx2crd(mn_local_tile_flat, c_smem_layout.shape)
-                sC[m_local, n_local] = cutlass.Float16(accumulators[reg_idx])
-            
-            cute.arch.sync_threads()
+        for kidx in range(k_tile_cnt):
+            # Wait for TMA load to complete for this stage
+            mainloop_pipeline.consumer_wait(consumer_read_state)
 
+            # WGMMA
+            cute.nvgpu.warpgroup.fence()
+
+            for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
+                k_block_coord = (None, None, k_block_idx, consumer_read_state.index)
+                tCrA_k = tCrA[k_block_coord]
+                tCrB_k = tCrB[k_block_coord]
+
+                cute.gemm(
+                    tiled_mma,
+                    accumulators,
+                    tCrA_k,
+                    tCrB_k,
+                    accumulators,
+                )
+                tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+
+            cute.nvgpu.warpgroup.commit_group()
+            cute.nvgpu.warpgroup.wait_group(0)
+
+            # Release this pipeline stage so producer can refill it
+            mainloop_pipeline.consumer_release(consumer_release_state)
+            consumer_read_state.advance()
+            consumer_release_state.advance()
+
+            # Refill pipeline (warp 0 only, if more tiles remain)
+            if warp_idx == 0 and producer_state.count < k_tile_cnt:
+                mainloop_pipeline.producer_acquire(producer_state)
+
+                cute.copy(
+                    tma_atom_a,
+                    tAgA[None, producer_state.count],
+                    tAsA[None, producer_state.index],
+                    tma_bar_ptr=mainloop_pipeline.producer_get_barrier(producer_state)
+                )
+                cute.copy(
+                    tma_atom_b,
+                    tBgB[None, producer_state.count],
+                    tBsB[None, producer_state.index],
+                    tma_bar_ptr=mainloop_pipeline.producer_get_barrier(producer_state)
+                )
+
+                mainloop_pipeline.producer_commit(producer_state)
+                producer_state.advance()
+
+        # =========== EPILOGUE: accumulators -> sC -> gmem ===========
+        tv_layout_C_tiled = tiled_mma.tv_layout_C_tiled
+
+        for reg_idx in range(cute.size(accumulators)):
+            coord = cute.idx2crd((tidx, reg_idx), tv_layout_C_tiled.shape)
+            mn_local_tile_flat = cute.crd2idx(coord, tv_layout_C_tiled)
+            m_local, n_local = cute.idx2crd(mn_local_tile_flat, c_smem_layout.shape)
+            sC[m_local, n_local] = cutlass.Float16(accumulators[reg_idx])
+
+        cute.arch.sync_threads()
         cute.arch.fence_proxy("async.shared", space="cta")
-        
+
+        # TMA store: sC -> gmem
         gC_tma = cute.local_tile(
             input=mC_tma_tensor,
             tiler=self.tile_shape_mnk,
             coord=tile_coord_mnk,
             proj=(1, 1, None)
         )
-        
+
         sC_for_tma_partition = cute.group_modes(sC, 0, 2)
         gC_for_tma_partition = cute.group_modes(gC_tma, 0, 2)
-        
+
         tCsC, tCgC_store = cute.nvgpu.cpasync.tma_partition(
             tma_atom_c,
             0,
@@ -359,8 +391,8 @@ class Gemm_TC:
             sC_for_tma_partition,
             gC_for_tma_partition,
         )
-        
-        if warp_group_idx == self.num_consumer_threads:
+
+        if warp_idx == 0:
             cute.copy(tma_atom_c, tCsC, tCgC_store)
 
     @staticmethod

@@ -19,7 +19,7 @@ app = modal.App("learn-cutedsl", image=image)
 
 @app.function(gpu="H100")
 def run_kernel():
-    from cutedsl.a2_smem_cuda_like import main
+    from cutedsl.c1_wgmma_tma_pipeline import main
     main()
 
 @app.local_entrypoint()
