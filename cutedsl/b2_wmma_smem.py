@@ -29,10 +29,8 @@ class Gemm_TC:
         mB: cute.Tensor, 
         mC: cute.Tensor,
     ):
-        # print("[DEBUG GEMM TC] from host")
-        
-        #===============================================
-        # MMA Layout
+        # ====== MMA Layout ======
+
         mma_op = cute.nvgpu.warp.MmaF16BF16Op(
             ab_dtype=cutlass.Float16, acc_dtype=cutlass.Float32, shape_mnk=self.mma_inst_shape)
         
@@ -52,13 +50,13 @@ class Gemm_TC:
             permutation_mnk=permutation_mnk)
 
         print(f"[DEBUG GEMM TC] tiled_mma: {tiled_mma}")
-        #===============================================
-        # SMEM layout
+        
+        # ====== SMEM layout ======
         padding = self._smem_padding
         sA_layout = cute.make_layout(shape=(self._bM, self._bK), stride=(self._bK + padding, 1))
         sB_layout = cute.make_layout(shape=(self._bN, self._bK), stride=(self._bK + padding, 1))
-        #===============================================
-        # COPY layout
+        
+        # ====== COPY layout ======
         num_vectorized = self._num_vectorized
         atom_copy_A = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
@@ -107,11 +105,14 @@ class Gemm_TC:
         tiled_mma: cute.TiledMma,
         permutation_mnk: Tuple
     ):
+        # ====== Thread, Block setup =======
+        bidx, bidy, _ = cute.arch.block_idx()
+        tid, _, _ = cute.arch.thread_idx()
+        
+        # ===== Smem allocation and copy setup ======
         allocator = cutlass.utils.SmemAllocator()
         sA = allocator.allocate_tensor(cutlass.Float16, sA_layout, 16, None)
         sB = allocator.allocate_tensor(cutlass.Float16, sB_layout, 16, None)
-        bidx, bidy, _ = cute.arch.block_idx()
-        tid, _, _ = cute.arch.thread_idx()    
         
         gA = cute.local_tile(
             input=mA, 
@@ -139,7 +140,7 @@ class Gemm_TC:
         tBgB = thr_copyB.partition_S(gB)
         tBsB = thr_copyB.partition_D(sB)
         
-        # ====================== Registers allocation for  MmaF16BF16Op
+        # ===== mma thread partitioning memory spaces =====
         thr_mma = tiled_mma.get_slice(tid)
         tCsA = thr_mma.partition_A(sA)
         tCsB = thr_mma.partition_B(sB)
@@ -148,11 +149,8 @@ class Gemm_TC:
         tCrA = tiled_mma.make_fragment_A(tCsA)
         tCrB = tiled_mma.make_fragment_B(tCsB)
         tCrC = tiled_mma.make_fragment_C(tCgC)
-
-        # Clear the accumulator
-        tCrC.fill(0.0)
         
-        # Creates the tiled copy so that it matches the thread-value layout
+        # ====== Shared memory to register copy ======
         atom_copy_s2r_A = cute.make_copy_atom(
             cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False,num_matrices=4),
             mA.element_type,
@@ -173,6 +171,8 @@ class Gemm_TC:
         tCsB_copy_view = thr_copy_ldmatrix_B.partition_S(sB)
         tCrB_copy_view = thr_copy_ldmatrix_B.retile(tCrB)
         
+        # ====== Main loop ======
+        tCrC.fill(0.0)
         
         for kidx in range(mA.shape[1] // self._bK):
             # Load sA, sB: gmem -> smem
@@ -214,6 +214,7 @@ class Gemm_TC:
             
             cute.arch.sync_threads()
         
+        # ====== Store results ======
         atom_universal = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             mC.element_type 

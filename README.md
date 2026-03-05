@@ -29,7 +29,7 @@ Section 1 walks through the optimization progression with measured FLOPS gains a
 
 CuTeDSL and CUDA in general have a very steep but rewarding learning curve, so don't get frustrated the first time you try it. The best approach is to look at examples, write kernels yourself, and observe the performance speedup — and understand *why* it speeds up. Once you can wrap your head around the concept of massively parallel programming with CUDA, subsequent kernels become much easier to digest.
 
-**Suggested progression:**
+Suggested progression:
 
 1. **Vector addition (a0)** — the classic gateway CUDA example. Plenty of online explanations exist. A CuTeDSL version is provided in this repo. CUDA has a broader ecosystem of YouTube videos and blog posts than CuTeDSL, but CuTeDSL is essentially a Python wrapper over CUDA/PTX so the concepts transfer directly.
 
@@ -51,7 +51,7 @@ CuTeDSL and CUDA in general have a very steep but rewarding learning curve, so d
 | Shared memory GEMM | [`a2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a2_smem_cuda_like.py) | Any | 7.17 |
 | WMMA tensor cores + SMEM | [`b2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b2_wmma_smem.py) | Ampere+ (SM80+) | 145.49 |
 | WMMA + TMA load/store | [`b5`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b5_wmma_tma_load_store.py) | Hopper+ (SM90+) | 186.88 |
-| WGMMA + TMA load/store | [`c1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c1_wgmma_tma_load_store.py) | Hopper (SM90) | 429.90 |
+| WGMMA + TMA load/store | [`c1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c1_wgmma_tma_load_store.py) | Hopper (SM90) | 446.14 |
 | WGMMA + TMA pipeline | [`c2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c2_wgmma_tma_pipeline.py) | Hopper (SM90) | 515.15 |
 | WGMMA + TMA warp-specialized pipeline | [`c3`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c3_wgmma_tma_specialized_pipeline.py) | Hopper (SM90) | 600.45 |
 | tcgen05 + TMA | [`d1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/d1_tcgen05_tma.py) | Blackwell (SM100) | TBD |
@@ -66,7 +66,7 @@ We can improve further by using techniques such as Persistent kernel to overlap 
 
 The building blocks you will encounter in every CuTeDSL kernel: how host and device code are structured, how to interface with PyTorch, and the core abstractions — Layout, Shared Memory, Copy Atoms, and MMA Atoms.
 
-### Host Code vs. Device Code
+### 2.1. Host Code vs. Device Code
 
 ```python
 @cute.jit   # host-side entry point
@@ -87,7 +87,52 @@ def my_kernel(...):
   tidx, tidy, _ = cute.arch.thread_idx()
   ```
 
-### Interfacing with PyTorch
+### 2.2. Interfacing with PyTorch
+
+#### 2.2.1. Traditional CUDA C++ Extension Workflow
+
+When writing custom CUDA kernels without CuTeDSL, you need glue code to bridge between PyTorch (Python) and the raw CUDA kernel. This involves three layers:
+
+1. **The CUDA kernel** ([`glue_code.cu`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cuda/glue_code.cu)) — implements the GPU computation, receives raw `void*` pointers and dispatches to the chosen kernel variant:
+   ```cpp
+   // cuda/glue_code.cu
+   void gemm_cuda(void* A, void* B, void* C, int M, int N, int K, int option) {
+       switch (option) {
+           case 0: naive::gemm_launcher(A, B, C, M, N, K); break;
+           case 4: wmma_smem::gemm_launcher(A, B, C, M, N, K); break;
+           // ...
+       }
+   }
+   ```
+
+2. **The Torch binding** ([`glue_code.cpp`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cuda/glue_code.cpp)) — unwraps `at::Tensor` objects into raw pointers and exposes the function to Python via `pybind11`:
+   ```cpp
+   // cuda/glue_code.cpp
+   void gemm(const at::Tensor& A, const at::Tensor& B, const at::Tensor& C,
+             int M, int N, int K, int option) {
+       gemm_cuda(A.data_ptr(), B.data_ptr(), C.data_ptr(), M, N, K, option);
+   }
+   PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+       m.def("gemm", &gemm, "GEMM (CUDA)", ...);
+   }
+   ```
+
+3. **The Python loader** ([`gemm_cuda.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cuda/gemm_cuda.py)) — uses `torch.utils.cpp_extension.load` to JIT-compile and import the extension:
+   ```python
+   # cuda/gemm_cuda.py
+   gemm_cuda_compiled = load(
+       name='gemm',
+       sources=[f"{dir_path}/glue_code.cu", f"{dir_path}/glue_code.cpp"],
+       extra_cuda_cflags=["-arch=sm_90", "-lineinfo"],
+       build_directory=build_dir,
+   )
+   ```
+
+Why are the CUDA kernel and Torch binding split into two separate source files? Separating `glue_code.cu` (CUDA-only code) from `glue_code.cpp` (Torch/pybind11 binding) prevents Ninja from compiling to large binary. Credit to the profiling experiment from [Lei Wang](https://github.com/LeiWang1999/CPPTorchExecutable).
+
+#### 2.2.2. CuTeDSL: No Glue Code Needed
+
+With CuTeDSL, all of the above boilerplate disappears. PyTorch tensors on the GPU are pointers into VRAM with metadata. [`from_dlpack`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a0_vector_addition.py#L43) uses the DLPack protocol to share that pointer with CuTeDSL without copying data:
 
 ```python
 from cutlass.cute.runtime import from_dlpack
@@ -95,13 +140,82 @@ from cutlass.cute.runtime import from_dlpack
 A_ = from_dlpack(A, assumed_align=16)   # wrap a torch.Tensor as a cute.Tensor
 ```
 
-PyTorch tensors on the GPU are pointers into VRAM with metadata. **[`from_dlpack`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a0_vector_addition.py#L43)** uses the DLPack protocol to share that pointer with CuTeDSL without copying data. No glue code (like `cuda/glue_code.cu`) is needed — CuTeDSL handles the bridge via MLIR/NVVM, making compilation much faster than traditional CUDA C++ extension workflows.
+CuTeDSL handles the bridge via MLIR/NVVM — no `pybind11` bindings, no `.cu`/`.cpp` glue files, no manual `data_ptr()` casting. Compilation is also faster thanks to an incremental JIT cache.
 
-### Layout and Linear indexing
+### 2.3. Threads and Blocks — the CUDA Execution Model
 
-When performing matrix multiplication we write `A[i, j] * B[j, k] = C[i, k]`, which uses 2-D indexing. Physical GPU memory is flat (1-D), so under the hood this multi-dimensional index is collapsed to a single pointer offset. In CUDA kernels we pass only a pointer to the first element of each memory block — no copies are made. CuTe's **Layout** abstraction makes this index arithmetic explicit and composable.
+When you call `.launch(grid=[Gx, Gy, 1], block=[Bx, By, 1])`, the GPU spawns `Gx × Gy` blocks (also called CTAs — Cooperative Thread Arrays), each containing `Bx × By` threads. Every thread runs the same kernel function but gets a different `(block_idx, thread_idx)` combination, so each one can compute its own unique slice of the output. The key identities are:
 
-Arguably the most important concept in CUTLASS CuTe / CuTeDSL. A `Layout` pairs a **shape** (extents in each dimension) with a **stride** (step size in linear memory per dimension). For example, a row-major 4×8 matrix has `shape=(4,8), stride=(8,1)` — moving one row down jumps 8 elements in memory.
+```
+global_row = block_idx.y * block_dim.y + thread_idx.y
+global_col = block_idx.x * block_dim.x + thread_idx.x
+```
+
+Threads within the same block can communicate via shared memory and synchronize with `sync_threads()`. Threads in different blocks cannot directly synchronize — they run independently. Understanding why the work is partitioned this way is the first mental hurdle in CUDA; if it's new to you, working through [`a0_vector_addition.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a0_vector_addition.py) and [`a1_naive_cuda_like.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cuda_like.py) yourself — tracing exactly which thread handles which element — is the most effective way to build that intuition.
+
+### 2.4. Layout and Linear indexing
+
+When performing matrix multiplication we write `A[i, j] * B[j, k] = C[i, k]`, which uses 2-D indexing. Physical GPU memory is flat (1-D), so every element access is ultimately just a pointer plus an integer offset: `*(base_ptr + offset)`. A multi-dimensional index `(row, col)` must be collapsed to that single offset before the hardware can fetch the value. For a row-major matrix of width `K`, the formula is `offset = row * K + col` — "skip `row` full rows of `K` elements, then `col` more". The matrix itself is never copied or rearranged in memory; only this arithmetic changes depending on layout. In traditional CUDA C++ you compute these offsets by hand and pass raw pointers. CuTe's Layout abstraction — a pairing of shape and stride — encodes the formula once and applies it automatically every time you index into a tensor, making the arithmetic explicit, verifiable, and composable across tiling levels.
+
+Arguably the most important concept in CUTLASS CuTe / CuTeDSL. A `Layout` pairs a **shape** (extents in each dimension) with a **stride** (step size in linear memory per dimension). The key formula is:
+
+$$\text{offset} = \sum_i \text{coord}_i \times \text{stride}_i$$
+
+For example, a row-major matrix `A` of shape `(M, K)` has `stride=(K, 1)`. Accessing element at row `r`, column `c` gives offset `r * K + c`. In memory this just means: "skip `r` full rows of `K` elements, then `c` more."
+
+#### 2.4.1. 1-D case: vector addition ([`a0_vector_addition.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a0_vector_addition.py))
+
+The simplest example — each thread computes a single linear index and indexes directly:
+
+```python
+# a0_vector_addition.py L29-L33
+bidx, _, _ = cute.arch.block_idx()
+bdimx, _, _ = cute.arch.block_dim()
+tidx, _, _ = cute.arch.thread_idx()
+
+i = bidx * bdimx + tidx   # global thread index = linear memory offset
+gC[i] = gA[i] + gB[i]    # stride=1 → offset == index
+```
+
+Here the tensor has `shape=(N,), stride=(1,)`, so the offset formula reduces to just `i * 1 = i` — no multi-dimensional arithmetic needed.
+
+#### 2.4.2. 2-D case: naïve GEMM ([`a1_naive_cuda_like.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cuda_like.py))
+
+In a naïve GEMM, each thread owns one output element `C[row, col]`. The 2-D index must be converted to a linear memory offset:
+
+```python
+# a1_naive_cuda_like.py L37-L40
+for k in range(K):
+    acc += cute.Float32(gA[bidy * bdimy + tidy, k]) * cute.Float32(gB[bidx * bdimx + tidx, k])
+
+gC[bidy * bdimy + tidy, bidx * bdimx + tidx] = cute.Float16(acc)
+```
+
+When you write `gA[row, col]`, CuTeDSL uses the Layout of `gA` to compute the pointer offset automatically:
+
+$$\text{offset}_A = \text{row} \times K + \text{col} \times 1$$
+
+For `A` of shape `(M, K)` stored row-major, `stride=(K, 1)`. So `gA[row, k]` reads from `base_ptr + row * K + k`. No manual offset arithmetic is needed — the Layout carries the stride information.
+
+#### 2.4.3. Tiling: going from elements to blocks ([`a1_naive_cute.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute.py))
+
+Rather than computing per-element offsets manually, `cute.local_tile` slices the global tensor into CTA-sized tiles. The resulting sub-tensor still carries a Layout, so all further indexing remains clean:
+
+```python
+# a1_naive_cute.py L29-L31
+tiler = (BM, BN, BK)
+coord = (bidx, bidy, None)   # None = "keep this dimension" (K-iteration axis)
+
+gA_tile = cute.local_tile(gA, tiler=tiler, coord=coord, proj=(1, None, 1))
+gB_tile = cute.local_tile(gB, tiler=tiler, coord=coord, proj=(None, 1, 1))
+gC_tile = cute.local_tile(gC, tiler=tiler, coord=coord, proj=(1, 1, None))
+```
+
+`proj` masks out which dimensions are "owned" by the CTA. For `gA_tile`, `proj=(1, None, 1)` means: fix the M and K tile coordinates to `(bidx, _, bidy)` respectively, and leave the inner K-iteration axis free so the kernel can loop over it. The pointer arithmetic for the tile origin is:
+
+$$\text{base\_A\_tile} = \text{base\_A} + \text{bidx} \times BM \times K + \text{bidy} \times BK$$
+
+This is computed once by `local_tile` and encoded into the sub-tensor's Layout; subsequent indexing within the tile uses only small local coordinates.
 
 **Construction:**
 ```python
@@ -144,7 +258,7 @@ layout_sA_swizzled = cute.make_composed_layout(
 *Used in [`a2_smem_cuda_swizzled.py` L35–L39](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a2_smem_cuda_swizzled.py#L35). See [`z0_swizzle.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/z0_swizzle.py#L7) for a standalone swizzle demo.*
 
 
-### Shared Memory
+### 2.5. Shared Memory
 
 Shared memory (SMEM) is an on-chip scratchpad shared by all threads in a block — roughly 100× lower latency than global memory. In CuTeDSL, SMEM is allocated with:
 
@@ -164,7 +278,7 @@ cute.arch.sync_threads()   # equivalent to __syncthreads() in CUDA C++
 *Used in [`a2_smem_cuda_like.py` L58](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a2_smem_cuda_like.py#L58). For async pipelines (TMA), `mbarrier`-based synchronization replaces this — see Section 6.*
 
 
-### Copy Atom
+### 2.6. Copy Atom
 
 A **Copy Atom** is the smallest unit of a hardware copy operation. A **Tiled Copy** wraps the atom and distributes the work across all threads in a CTA to fill or drain a tile efficiently.
 
@@ -188,7 +302,7 @@ tAgA = thr_copy.partition_D(gA)             # destination partition (this thread
 cute.copy(tiled_copy, tAgA, tAsA)           # every thread copies its own subtensor
 ```
 
-> **Naming convention** — the prefix encodes both the partitioner and the tensor. `tAsA` is read as *"partitioning pattern `tA` applied to tensor `sA`"*. The same partitioner `tA` is applied to both `sA` (shared memory) and `gA` (global memory) to produce `tAsA` and `tAgA`. Because both tensors use *the same* partitioning pattern, CuTe can assert that corresponding logical elements match across the two tensors, even if their physical data layouts differ. When you later write `cute.copy(tiled_copy, tAgA, tAsA)`, you can lexically verify that source and destination are partitioned consistently — a naming convention borrowed directly from CUTLASS CuTe C++. The prefix letter also encodes the memory space: `s` = shared memory, `g` = global memory, `r` = register.
+> Naming convention — the prefix encodes both the partitioner and the tensor. `tAsA` reads as "partitioning pattern `tA` applied to tensor `sA`". The same partitioner `tA` is applied to both `sA` (shared memory) and `gA` (global memory) to produce `tAsA` and `tAgA`. Because both tensors use the same partitioning pattern, CuTe can assert that corresponding logical elements match across the two tensors, even if their physical data layouts differ. When you write `cute.copy(tiled_copy, tAgA, tAsA)`, you can verify that source and destination are partitioned consistently — a naming convention borrowed from CUTLASS CuTe C++. The prefix letter encodes the memory space: `s` = shared memory, `g` = global memory, `r` = register.
 
 | Copy Op | Direction | Notes |
 |---|---|---|
@@ -198,7 +312,7 @@ cute.copy(tiled_copy, tAgA, tAsA)           # every thread copies its own subten
 | `CopyBulkTensorTileS2GOp` | SMEM → GMEM | TMA async store. Used in [`c1_wgmma_tma_load_store.py` L92](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c1_wgmma_tma_load_store.py#L92) |
 
 
-### MMA Atom
+### 2.7. MMA Atom
 
 An **MMA Atom** wraps a single hardware matrix-multiply-accumulate instruction. A **Tiled MMA** tiles this atom across threads and repeats it to cover a larger output tile.
 
@@ -229,9 +343,6 @@ tCrC.fill(cute.Float32(0))
 cute.gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC)   # issue MMA
 ```
 
-> **Naming convention** — the same `tC` partitioner (derived from `thr_mma`) is applied to `sA`, `sB`, and `gC` to produce `tCsA`, `tCsB`, and `tCgC`. This is the *math partitioning* counterpart of the copy partitioning above. Because `tCsA` and `tAgA` use *different* partitioners (`tC` vs `tA`), they cannot be passed directly to `cute.copy` — you first need to `retile` the copy view to match the MMA layout, as done with `thr_copy_ldmatrix.retile(tCrA)` in [`b2_wmma_smem.py` L171](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b2_wmma_smem.py#L171).
-*Used in [`a1_naive_cute.py` L43–L44](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute.py#L43) and [`b2_wmma_smem.py` L143–L147](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b2_wmma_smem.py#L143).*
-
 | MMA Op | GPU | Notes |
 |---|---|---|
 | `MmaUniversalOp` | all | Scalar FMA tiled to any shape — used for naïve cute GEMM in [`a1_naive_cute.py` L37](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute.py#L37) |
@@ -246,10 +357,51 @@ cute.gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC)   # issue MMA
 
 In CUDA optimization, one strategy is to fuse multiple operations — for example, performing GEMM and immediately applying an element-wise transformation on the accumulator — without ever materializing the large output tensor to global memory. This requires knowing exactly which thread holds which output element.
 
-For example, in a custom RNN kernel that achieved 90–110× speedup over PyTorch, the key insight was to avoid materializing the large matC, then performing a GEMV (matrix-vector multiplication) on it afterwards. Instead, the GEMV was fused directly into the accumulator registers. This requires mapping each thread's accumulator registers to logical `(m, n)` coordinates.
+For example, in my custom RNN kernel that achieved 90–110× speedup over PyTorch [Repo link](https://github.com/chongxi/rnn_train_ring_attractor/blob/main/cpp/kernels/fwd_1loop_tc_idx.cuh#L172), the key insight was to avoid materializing the large matC, and performing a GEMV (matrix-vector multiplication) directly on the fragC on register file. This requires mapping each thread's accumulator registers to logical `(m, n)` coordinates.
 
-By reading the PTX documentation one can derive this mapping manually with modulo and integer division (see the C++ `tv2mn` template in `README.md`). CuTe provides this formula automatically through the **TV Layout** of the MMA atom.
+By reading the PTX documentation one can derive this mapping manually with modulo and integer division [CUDA C++ Example](https://github.com/chongxi/rnn_train_ring_attractor/blob/main/cpp/kernels/fwd_1loop_tc_idx.cuh#L6). 
 
+```c++
+template<int WMMA_M, int WMMA_N, int WMMA_K, typename T>
+__device__ void tv2mn(wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float>& fragC)
+{
+    /*
+    *16x16 FragC Register Layout (4 quadrants, each with 2 registers)
+    *Only support m16n16k16 and m32n8k16.
+            +---------+---------+
+            | r0  r1  | r4  r5  |
+    0-7  |         |         |
+            | Block 0 | Block 1 |
+            +---------+---------+
+            | r2  r3  | r6  r7  |
+    8-15 |         |         |
+            | Block 2 | Block 3 |
+            +---------+---------+
+            0-7       8-15
+    */
+    constexpr int NUM_REGBLOCK_ROWS = WMMA_M / 8;
+    constexpr int NUM_REGBLOCK_COLS = WMMA_N / 8;
+    constexpr int REGS_PER_BLOCK = 2;
+    
+    size_t threadID_in_warp = threadIdx.x % WARPSIZE;
+    size_t groupID_in_warp = threadID_in_warp / 4;
+    size_t threadID_in_group = threadID_in_warp % 4;
+    
+    for (int regBlockRow = 0; regBlockRow < NUM_REGBLOCK_ROWS; ++regBlockRow) {
+        for (int regBlockCol = 0; regBlockCol < NUM_REGBLOCK_COLS; ++regBlockCol) {
+            for (int i = 0; i < REGS_PER_BLOCK; ++i) {
+                int regID = (regBlockRow * REGS_PER_BLOCK) +
+                        (regBlockCol * NUM_REGBLOCK_ROWS * REGS_PER_BLOCK) + i;
+                size_t m = regBlockRow * 8 + groupID_in_warp;
+                size_t n = regBlockCol * 8 + threadID_in_group * 2 + i;
+                // use m, n for indexing
+            }
+        }
+    }
+}    
+```
+
+CUTLASS devs made our life much easier by providing the **TV Layout** (Thread-Value Layout) of the MMA atom.
 Printing the atom and tiled MMA for the warp-level `F16/BF16 → F32` instruction (script `b2_wmma_smem.py`) gives:
 
 ```
@@ -277,7 +429,7 @@ for reg_idx in range(cute.size(tCrC_out)):
 
 For example, with `tid=11` and `reg_idx=3`, `coord` is `((3,2,0,0),((1,1),(0,0)))`, `mn_flat` is `1547`, and the resulting logical coordinate is `m=11, n=24`. See `z1_tv2mn.py` for a runnable demo.
 
-This same "do not materialize" pattern underpins the **Implicit GEMM** algorithm, where the `im2col` matrix is computed on the fly tile-by-tile and loaded into SMEM, allowing convolution to use tensor cores efficiently.
+This same "do not materialize" pattern underpins the **Implicit GEMM** algorithm, where the `im2col` matrix is computed on the fly tile-by-tile and loaded into SMEM, allowing convolution to use tensor cores efficiently and minimizing round-trip gmem reads and writes.
 
 </details>
 
@@ -288,7 +440,7 @@ Hopper (SM90) introduced two complementary hardware features that together enabl
 
 ---
 
-### Tensor Memory Accelerator (TMA)
+### 4.1. Tensor Memory Accelerator (TMA)
 
 Without TMA the data flow for loading a tile is:
 
@@ -304,33 +456,253 @@ GMEM → SMEM   (direct, asynchronous, no register allocation)
 
 The issuing thread returns immediately after launching the TMA copy; the hardware writes data into shared memory in the background and signals completion via an **mbarrier** (see Section 5 for details). This leaves more registers free for computation. TMA also handles multi-dimensional address calculations, stride, and boundary clamping in hardware, removing that logic from the kernel.
 
-Example `c1_wgmma_tma_load_store.py` shows TMA as a drop-in replacement for manual `cp.async` SMEM loading, yielding a clean speedup while remaining portable to SM90, SM100, and SM120.
+Example `b5` shows TMA as a drop-in replacement for manual SMEM loading, yielding a nice speedup while remaining portable to SM90, SM100, and SM120.
 
-Key API:
+#### 4.1.1. Two-step Process
+
+TMA is always set up in two distinct steps — unlike a regular `TiledCopy` where everything lives in kernel code:
+
+1. **Host side**: Build a `cuTensorMap` descriptor encoding the GMEM tensor's base pointer, shape, strides, and swizzle mode. This is done once, at Python (host) level, and passed to the kernel as `__grid_constant__ const`. The descriptor cannot be modified by the device.
+2. **Kernel side**: A single thread issues the copy instruction referencing the descriptor. The hardware does all address arithmetic and predication (out-of-bounds clamping) without any thread-level register involvement.
+
+#### 4.1.2. TMA Load: GMEM → SMEM
+
 ```python
-tma_atom = cute.nvgpu.cpasync.TmaLoad(...)
-cute.copy(tma_atom, gmem_src, smem_dst, tma_bar_ptr=barrier)
+# Host: build the TMA atom + "ArithTuple" GMEM coordinate tensor
+tma_atom_a, tma_tensor_a = cute.nvgpu.cpasync.make_tiled_tma_atom(
+    cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(),  # direction: Global→Shared
+    gmem_tensor_a,                                  # source GMEM tensor
+    smem_layout,                                    # destination SMEM layout per CTA
+    (BM, BK),                                       # tile extents
+)
+
+# Kernel: partition then copy
+tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(tma_atom_a, cta_crd, cta_layout, sA, gA)
+cute.copy(tma_atom_a, tAgA[None, kidx], tAsA[None, 0], tma_bar_ptr=mbar_ptr)
+```
+*Used in [`c1_wgmma_tma_load_store.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c1_wgmma_tma_load_store.py#L391).*
+
+The GMEM-side of `tma_partition` returns **ArithTuples**, not raw pointers. These are coordinate objects — the TMA descriptor resolves them to actual addresses. This is how TMA handles OOB predication: it never performs pointer arithmetic that could go out-of-bounds.
+
+mbarrier synchronization protocol (only for TMA load — 4 steps):
+
+| Step | CuTeDSL call | Underlying PTX | Who |
+|---|---|---|---|
+| Init | `mbarrier_init(mbar_ptr, cnt=1)` | `mbarrier.init.shared.b64` | thread 0 |
+| Expect | `mbarrier_expect_tx(mbar_ptr, tx_bytes)` | `mbarrier.arrive.expect_tx.shared::cta.b64` | thread 0 — sets expected byte count |
+| Issue | `cute.copy(..., tma_bar_ptr=mbar_ptr)` | `cp.async.bulk.tensor.Nd ...mbarrier::complete_tx::bytes` | warp 0 — TMA hw decrements counter as bytes land |
+| Wait | `mbarrier_wait(mbar_ptr, phase=0)` | `mbarrier.try_wait.parity.shared::cta.b64` | **all** threads — sleep until barrier flips phase |
+
+The **phase bit** alternates (0 → 1 → 0 → …) each time the barrier is reused. In `c1` the barrier is re-initialized each K iteration (single-stage). In the multi-stage pipeline (`c2`/`c3`) the pipeline API cycles phases automatically.
+
+```python
+# Excerpt from the K-tile loop in c1_wgmma_tma_load_store.py
+if tidx == 0:
+    cute.arch.mbarrier_init(mbar_ptr, cnt=1)
+    cute.arch.mbarrier_init_fence()
+
+cute.arch.sync_threads()   # all threads wait for barrier to finish init on smem, as they will need to access this later
+
+if warp_idx == 0:
+    if tidx == 0:
+        cute.arch.mbarrier_expect_tx(mbar_ptr, tma_transaction_bytes)
+        cute.arch.mbarrier_arrive(mbar_ptr)
+    cute.copy(tma_atom_a, tAgA[None, kidx], tAsA[None, 0], tma_bar_ptr=mbar_ptr)
+    cute.copy(tma_atom_b, tBgB[None, kidx], tBsB[None, 0], tma_bar_ptr=mbar_ptr)
+
+cute.arch.mbarrier_wait(mbar_ptr, 0)   # all threads block here
+```
+*[`c1_wgmma_tma_load_store.py` lines 287–305](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c1_wgmma_tma_load_store.py#L287).*
+
+Descriptor prefetch — at kernel start, warp 0 warms the constant cache holding the descriptor before the K-loop:
+
+```python
+if warp_idx == 0:
+    cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
+    cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)
+```
+
+#### 4.1.3. TMA Store: SMEM → GMEM
+
+```python
+# Host: build TMA atom for the output tile
+tma_atom_c, tma_tensor_c = cute.nvgpu.cpasync.make_tiled_tma_atom(
+    cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(),  # direction: Shared→Global
+    gmem_tensor_c,
+    c_smem_layout,
+    (BM, BN),
+)
+
+# Kernel: fence BEFORE the copy, then issue from one warp
+cute.arch.sync_threads()
+cute.arch.fence_proxy("async.shared", space="cta")   # fence.proxy.async.shared::cta
+if warp_idx == 0:
+    cute.copy(tma_atom_c, tCsC, tCgC_store)
+```
+*[`c1_wgmma_tma_load_store.py` lines 354–379](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c1_wgmma_tma_load_store.py#L354).*
+
+Why a proxy fence and not an mbarrier?
+TMA store operates in the async proxy (with respect to the CTA). Without `fence.proxy.async.shared::cta`, the TMA hardware could read stale values from SMEM.
+
+The fence goes before the store (opposite of mbarrier for loads, which waits after).
+
+If the SMEM buffer for `sC` needs to be reused (e.g., multi-wave pipeline), add arrive/wait around the store:
+
+```python
+# cute.arch.tma_store_arrive()   # commit the store into a bulk group
+# cute.arch.tma_store_wait(0)    # wait until 0 groups remain in-flight
+```
+
+#### 4.1.4. SMEM Layout Requirements and Stride Constraints
+
+The SMEM layouts for A and B use **swizzled layouts** to avoid bank conflicts and satisfy the memory format that WGMMA instructions expect. These are built automatically by `sm90_utils.make_smem_layout_a/b`.
+
+For the GMEM tensor, TMA requires:
+- One dimension must be **stride-1** (contiguous).
+- All other strides must be **multiples of 16 bytes**. For `float16` this means the leading dimension must be divisible by 8 (e.g., `K % 8 == 0` for a row-major A of shape `(M, K)`).
+
+This is why inputs are created with `assumed_align=16`:
+```python
+A_ = from_dlpack(A, assumed_align=16)
 ```
 
 ---
 
-### Warp Group Matrix Multiplication (WGMMA)
+### 4.2. Warp Group Matrix Multiplication (WGMMA)
 
-**WGMMA** is a faster tensor core instruction that requires a full **warpgroup** (4 warps = 128 threads) to issue together. Key properties:
+**WGMMA** (`wgmma.mma_async`) is Hopper's tensor core instruction. It supersedes the warp-level `wmma` instruction used on Ampere and earlier. Key differences from `wmma`:
 
-- **Asynchronous**: `cute.gemm(tiled_mma, ...)` returns immediately while the tensor cores compute in the background, reading operands directly from **shared memory** (not registers).
-- **Higher throughput** than the register-based `mma` / `wmma` instructions used on earlier GPUs.
-- **Requires new synchronization primitives** to track when the hardware has finished reading from SMEM before that stage can be released back to the producer.
+- **Warpgroup-wide**: requires all **128 threads** in a warpgroup (4 contiguous warps whose first warp rank is a multiple of 4) to issue the instruction collectively.
+- **Asynchronous**: `cute.gemm(tiled_mma, ...)` returns immediately; the tensor cores continue computing in the background, reading operands directly from **SMEM via matrix descriptors** (not registers), and writing to register-backed accumulators.
+- **B operand always comes from SMEM**. A can come from SMEM (`SS` mode) or registers (`RS` mode). In `c1`, both A and B are sourced from SMEM (SS mode).
+- **Higher throughput** than `wmma` — responsible for the 2.3× jump from `b5` to `c1` in the FLOPS table.
 
-The three WGMMA fence/commit/wait primitives:
+#### 4.2.1. WGMMA Atom Shape Constraints
 
-| Primitive | Purpose |
-|---|---|
-| `warpgroup.fence()` | Ensures prior memory ops are ordered before WGMMA issues |
-| `warpgroup.commit_group()` | Seals all WGMMA instructions issued since the last commit into one group |
-| `warpgroup.wait_group(N)` | Blocks until at most N committed groups are still in-flight |
+The underlying PTX instruction is `wgmma.mma_async.sync.aligned.M64xNxK`. The tile shape is constrained:
+- **M is always 64** — one WGMMA atom always covers 64 rows.
+- **K × sizeof(dtype) = 32 bytes** — so for `float16`, K = 16; for `float8`, K = 32.
+- **N is a multiple of 8, from 8 to 256**.
 
-For example, if `BK=64` and `WGMMA_K=16`, we issue 4 WGMMA calls in a loop and then call `commit_group()` to group them into one trackable unit. `wait_group(0)` blocks until that group finishes, ensuring SMEM is safe to reuse.
+This imposes the assertions in `c1`:
+```python
+assert self.BM % 64 == 0, "bM must be divisible by 64 for WGMMA"
+assert self.BN % 64 == 0, "bN must be divisible by 64 for WGMMA"
+```
+
+#### 4.2.2. TiledMMA Construction
+
+In `c1`, the `TiledMMA` is built on the host via a CuTeDSL helper:
+
+```python
+# c1_wgmma_tma_load_store.py — host (__call__)
+self.tiled_mma = sm90_utils.make_trivial_tiled_mma(
+    self.a_dtype,
+    self.b_dtype,
+    self.a_layout.sm90_mma_major_mode(),   # MN-major or K-major (matches memory layout)
+    self.b_layout.sm90_mma_major_mode(),
+    self.acc_dtype,                         # Float32 accumulator
+    self.atom_layout_mnk,                   # e.g. (1,1,1) = one warpgroup
+    tiler_mn=(64, self.tile_shape_mnk[1]), # the M×N output tile per warpgroup
+)
+```
+*[`c1_wgmma_tma_load_store.py` L125–L133](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c1_wgmma_tma_load_store.py#L125).*
+
+`atom_layout_mnk` tiles the single 64×N atom across multiple warpgroups. For `BM=64`, it is `(1,1,1)` (one warpgroup). For `BM=128`, setting it to `(2,1,1)` assigns 2 warpgroups to split the M-dimension, each computing a 64×N subtile independently. The total thread count becomes:
+
+```python
+self.threads_per_cta = math.prod(self.atom_layout_mnk) * 128  # warpgroups × 128 threads
+```
+
+For `float16`, both MN-major and K-major are supported. For other dtypes, only K-major is allowed (no transpose support in PTX for non-16-bit).
+
+#### 4.2.3. Per-Thread Slicing and Fragments
+
+On device, slice the `TiledMMA` per warpgroup (not per thread as with `wmma`):
+
+```python
+# c1_wgmma_tma_load_store.py — kernel
+warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
+warp_group_thread_layout = cute.make_layout(
+    self.mma_warp_groups, stride=self.num_threads_per_warp_group
+)
+thr_mma = tiled_mma.get_slice(warp_group_thread_layout(warp_group_idx))
+
+tCsA = thr_mma.partition_A(sA)   # shape: (MMA_ATOM, MMA_M, MMA_K, stages)
+tCsB = thr_mma.partition_B(sB)   # shape: (MMA_ATOM, MMA_N, MMA_K, stages)
+tCrA = tiled_mma.make_fragment_A(tCsA)
+tCrB = tiled_mma.make_fragment_B(tCsB)
+```
+
+`tCrA` and `tCrB` are not register tensors — they are `GMMA::DescriptorIterator` objects. Internally each is a 64-bit matrix descriptor held in registers that points into SMEM. The descriptor encodes the SMEM base address, leading byte offset (LBO), stride byte offset (SBO), and swizzle mode. `wgmma.mma_async` reads the descriptor from registers but fetches the actual matrix data directly from SMEM via the L2 cache, bypassing registers entirely. Only the current descriptor (not all of them) is held in registers at any given time — hence "Iterator".
+
+In contrast, `tCrC` (the accumulator) is a register-backed tensor — the 32 output values per thread for a 64×64 output atom are stored in registers.
+
+#### 4.2.4. SMEM Layout Constraints
+
+The SMEM layouts for `sA` and `sB` must satisfy two requirements for WGMMA:
+
+1. **Tile divisibility**: `BM` must be a multiple of 64, `BN` a multiple of 64 (or the chosen N), `BK` a multiple of 16 (for fp16).
+2. **Swizzle compatibility**: the SMEM layout must use one of the canonical GMMA swizzle atoms (`SW128`, `SW64`, `SW32`, or no-swizzle) tiled to shape `(BM, BK)` or `(BN, BK)`.
+
+In `c1` these are built automatically:
+
+```python
+self.a_smem_layout_staged = sm90_utils.make_smem_layout_a(
+    a_layout=self.a_layout,         # determines MN-major vs K-major atom
+    mma_tiler_mnk=self.tile_shape_mnk,
+    a_dtype=self.a_dtype,
+    num_stages=self.num_stages
+)
+# Prints: S<3,4,3> o 0 o ((8,16),(64,1),(1,1)):((64,512),(1,0),(0,0))
+# i.e., Sw<3,4,3> (128-byte swizzle) composed over the base layout
+```
+
+Swizzled layouts eliminate SMEM bank conflicts and also ensure the matrix descriptor's LBO/SBO fields are set correctly by `make_gmma_desc` inside CUTLASS.
+
+#### 4.2.5. Synchronization Protocol
+
+WGMMA executes in the async proxy (same as TMA). The correct sequence (wrapped by CuTeDSL) maps to PTX as follows:
+
+```python
+# 1. Before the first GEMM — fence RMEM/SMEM accesses across warpgroup
+cute.nvgpu.warpgroup.fence()          # PTX: wgmma.fence.sync.aligned
+
+# 2. Issue WGMMA (returns immediately; runs async in background)
+#    Inner loop over MMA_K automatically issues MMA_K/k_atom many wgmma instructions
+cute.gemm(tiled_mma, accumulators, tCrA_k, tCrB_k, accumulators)
+
+# 3. Seal all outstanding wgmma instructions into one trackable group
+cute.nvgpu.warpgroup.commit_group()   # PTX: wgmma.commit_group.sync.aligned
+
+# 4. Block until at most N groups are still in-flight
+cute.nvgpu.warpgroup.wait_group(0)    # PTX: wgmma.wait_group.sync.aligned 0
+```
+*[`c1_wgmma_tma_load_store.py` L305–L326](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c1_wgmma_tma_load_store.py#L305).*
+
+| Primitive | PTX instruction | Purpose |
+|---|---|---|
+| `warpgroup.fence()` | `wgmma.fence.sync.aligned` | Orders prior RMEM/SMEM writes before WGMMA reads them. Required at the start of each GEMM call when the accumulator is being reused |
+| `cute.gemm(...)` | `wgmma.mma_async.sync.aligned.*` | Issues the async MMA; each inner K-block loop issues one instruction |
+| `warpgroup.commit_group()` | `wgmma.commit_group.sync.aligned` | Groups all prior uncommitted `wgmma.mma_async` instructions into one wgmma-group for tracking |
+| `warpgroup.wait_group(N)` | `wgmma.wait_group.sync.aligned N` | Blocks until ≤ N wgmma-groups remain in-flight |
+
+Why `wait_group(0)` here? In `c1` there is only one pipeline stage, so the consumer must wait for WGMMA to finish reading `sA`/`sB` before the next K-iteration overwrites them. A multi-stage pipeline (`c2`, `c3`) can set `wait_group(1)` — wait for the previous group while the current group is still running — enabling overlap of SMEM loads and compute.
+
+Note: `fence.proxy.async` (used for TMA store) is not needed before WGMMA when SMEM is populated by TMA. TMA itself is in the async proxy, and the `mbarrier_wait` that gates TMA load completion already ensures visibility to WGMMA. `fence.proxy.async` would only be needed if SMEM were written by ordinary thread stores.
+
+#### 4.2.6. The ACCUMULATE Flag
+
+```python
+# Before the very first GEMM tile — zero-initialize the accumulators
+tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)  # C = A*B (not A*B + C)
+
+# After the first tile — accumulate into existing registers
+tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)   # C = A*B + C
+```
+*[`c1_wgmma_tma_load_store.py` L284 and L323](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c1_wgmma_tma_load_store.py#L284).*
+
+This maps to the `scale_D` parameter in the PTX instruction: `0` zero-initializes the accumulator, `1` adds to it. Setting `False` before the first tile avoids the overhead of a separate `fill(0)` on the accumulator register fragment.
 
 </details>
 
@@ -339,7 +711,7 @@ For example, if `BK=64` and `WGMMA_K=16`, we issue 4 WGMMA calls in a loop and t
 
 Hopper's new barrier primitives allow us to overlap memory transactions and computation. CuTeDSL exposes this via `PipelineAsync` and `PipelineTmaAsync`.
 
-### Warp Specialization
+### 5.1. Warp Specialization
 
 We split work by **role** rather than by data:
 
@@ -348,7 +720,7 @@ We split work by **role** rather than by data:
 
 Different warps can take entirely different code paths with zero divergence penalty because they are independently scheduled by the warp scheduler. By doing this, we can overlap the computation done by the consumer with the SMEM filling of the producer. This technique is called **warp specialization**.
 
-### Pipeline Communication via Barriers in Shared Memory
+### 5.2. Pipeline Communication via Barriers in Shared Memory
 
 Producer and consumer warps communicate via **`mbarrier`** objects stored in shared memory (visible to all threads in a block), which acts as a communication channel for different warps so they can signal each other when data is ready to be consumed or when the data on that smem parition is consumed and ready to be filled with new data. Each pipeline stage gets its own barrier, organized as a **circular buffer** — after the last stage we wrap back to stage 0.
 
@@ -359,7 +731,7 @@ Each barrier tracks a **phase** that alternates between even and odd. The two ra
 
 With `S` stages the producer can run up to `S` iterations ahead of the consumer, hiding memory latency behind computation.
 
-### PipelineAsync (Synchronous Writes + Synchronous MMA)
+### 5.3. PipelineAsync (Synchronous Writes + Synchronous MMA)
 
 Used when the producer writes to SMEM via regular thread stores (synchronous) and the consumer uses register-based MMA (synchronous). The only concern is preventing race conditions between the two warpgroups.
 
@@ -387,7 +759,7 @@ for k in range(K):
     handle.release()                          # signal "stage free"
 ```
 
-### PipelineTmaAsync (Async TMA Loads + Async WGMMA)
+### 5.4. PipelineTmaAsync (Async TMA Loads + Async WGMMA)
 
 Used on Hopper when both the producer (TMA) and consumer (WGMMA) are asynchronous. Two complementary mechanisms track completion:
 
@@ -487,7 +859,7 @@ TMA warp (producer)                   MMA warps (consumer)
       │  ◄───────────────────────────────────├─ consumer_release()
 ```
 
-### What About SM120 (Blackwell RTX)?
+### 5.5. What About SM120 (Blackwell RTX)?
 
 SM120 has TMA but **no WGMMA**. It uses register-based MMA (`ldmatrix` + `mma`). Key differences from SM90:
 
@@ -554,7 +926,13 @@ Blackwell (SM100) introduces **tcgen05**, a new generation of tensor core instru
 
 Script `d1_tcgen05_tma.py` provides an example of tcgen05 combined with TMA loads.
 
-> Full documentation coming soon.
+Q: Why make_fragment_A(sA) instead of make_fragment_A(tCsA)?
+
+For WGMMA (SM90), thr_mma = tiled_mma.get_slice(tidx) maps a thread to its subset of A. So partition_A(sA) gives the per-thread view, and make_fragment_A on that makes sense.
+
+For UMMA (SM100), tiled_mma.get_slice(0) is a CTA-level slice — there's no thread partitioning of A/B operands because UMMA reads SMEM via hardware descriptors, not per-thread register loads. The fragment it creates (tCrA) is a tensor of SMEM matrix descriptors, not actual register data. Those descriptors point into the full sA, so you pass sA directly. partition_A(gA) is still needed but only to give the right GMEM-side shape for TMA partitioning — not for making the MMA fragment.
+
+
 
 </details>
 
@@ -586,8 +964,9 @@ modal run submit_modal.py
 2. https://cudaforfun.substack.com/p/outperforming-cublas-on-h100-a-worklog
 3. https://research.colfax-intl.com/tutorial-hopper-tma/
 4. https://research.colfax-intl.com/cutlass-tutorial-wgmma-hopper/
-5. https://gau-nernst.github.io/tcgen05/
-6. https://hazyresearch.stanford.edu/blog/2026-02-19-tk-2
-7. https://github.com/LeiWang1999/CPPTorchExecutable
-8. https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/overview.html
-9. https://research.colfax-intl.com/cutlass-tutorial-writing-gemm-kernels-using-tensor-memory-for-nvidia-blackwell-gpus/
+5. https://research.colfax-intl.com/cutlass-tutorial-writing-gemm-kernels-using-tensor-memory-for-nvidia-blackwell-gpus/
+6. https://gau-nernst.github.io/tcgen05/
+7. https://hazyresearch.stanford.edu/blog/2026-02-19-tk-2
+8. https://github.com/LeiWang1999/CPPTorchExecutable
+9. https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/overview.html
+10. https://research.colfax-intl.com/cutlass-tutorial-writing-gemm-kernels-using-tensor-memory-for-nvidia-blackwell-gpus/

@@ -36,7 +36,6 @@ class Gemm_TC:
 
         self.num_stages = 5
         self.buffer_align_bytes = 1024
-        self.cluster_shape_mn = (1, 1)
         
     @cute.jit
     def __call__(
@@ -53,8 +52,6 @@ class Gemm_TC:
         self.b_layout = utils.LayoutEnum.from_tensor(b)
         self.c_layout = utils.LayoutEnum.from_tensor(c)
         
-        cta_layout_mnk = cute.make_layout((*self.cluster_shape_mn, 1))        
-
         # Create swizzled layout: S<3,4,3> o 0 o ((8,16),(64,1),(1,1)):((64,512),(1,0),(0,0))
         self.a_smem_layout_staged = sm90_utils.make_smem_layout_a(
             a_layout=self.a_layout,
@@ -74,27 +71,27 @@ class Gemm_TC:
         tma_atom_a, tma_tensor_a = self._make_tma_atoms_and_tensors(
             a,
             self.a_smem_layout_staged,
-            (self.tile_shape_mnk[0], self.tile_shape_mnk[2]),
+            (self.BM, self.BK),
             1,
         )
 
         tma_atom_b, tma_tensor_b = self._make_tma_atoms_and_tensors(
             b,
             self.b_smem_layout_staged,
-            (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
+            (self.BN, self.BK),
             1,
         )
 
         c_smem_layout = cute.make_layout(
-            (self.tile_shape_mnk[0], self.tile_shape_mnk[1]),
-            stride=(self.tile_shape_mnk[1], 1)
+            (self.BM, self.BN),
+            stride=(self.BN, 1)
         )
         
         tma_atom_c, tma_tensor_c = cute.nvgpu.cpasync.make_tiled_tma_atom(
             cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(),
             c,
             c_smem_layout,
-            (self.tile_shape_mnk[0], self.tile_shape_mnk[1]),
+            (self.BM, self.BN),
         )
 
         @cute.struct
@@ -111,7 +108,7 @@ class Gemm_TC:
                 self.buffer_align_bytes,
             ]
             sC: cute.struct.Align[
-                cute.struct.MemRange[self.c_dtype, self.tile_shape_mnk[0] * self.tile_shape_mnk[1]],
+                cute.struct.MemRange[self.c_dtype, self.BM * self.BN],
                 self.buffer_align_bytes,
             ]
 
@@ -124,7 +121,7 @@ class Gemm_TC:
             self.b_layout.sm90_mma_major_mode(),
             self.acc_dtype,
             self.atom_layout_mnk,
-            tiler_mn=(64, self.tile_shape_mnk[1]),
+            tiler_mn=(64, self.BN),
         )
 
         print("tiled_mma: ", self.tiled_mma)
@@ -138,7 +135,6 @@ class Gemm_TC:
             tma_atom_c,
             tma_tensor_c,
             self.tiled_mma,
-            cta_layout_mnk,
             c,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -157,23 +153,17 @@ class Gemm_TC:
         tma_atom_c: cute.CopyAtom,
         mC_tma_tensor: cute.Tensor,
         tiled_mma: cute.TiledMma,
-        cta_layout_mnk: cute.Layout,
         mC: cute.Tensor,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
     ):
-
+        # ====== Thread, Block setup =======
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
         if warp_idx == 0:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)  
-
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(
-            cute.arch.block_idx_in_cluster()
-        )
-        cluster_coord_mnk = cta_layout_mnk.get_flat_coord(cta_rank_in_cluster)
 
         bidx, bidy, _ = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
@@ -186,6 +176,7 @@ class Gemm_TC:
         )
         thr_mma = tiled_mma.get_slice(warp_group_thread_layout(warp_group_idx))
 
+        # ===== Smem allocation and copy setup ======
         a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
         b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, 0))
 
@@ -226,33 +217,31 @@ class Gemm_TC:
             tiler=self.tile_shape_mnk,
             coord=tile_coord_mnk,
             proj=(1, 1, None))
-        
-        tCgC = thr_mma.partition_C(gC)
 
-        a_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (0, None, 0)).shape)
-        a_cta_crd = cluster_coord_mnk[1]
+        # ===== TMA partition setup =====
         sA_for_tma_partition = cute.group_modes(sA, 0, 2)
         gA_for_tma_partition = cute.group_modes(gA, 0, 2)
         tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
             tma_atom_a,
-            a_cta_crd,
-            a_cta_layout,
+            0,
+            cute.make_layout(1),
             sA_for_tma_partition,
             gA_for_tma_partition,
         )
 
-        b_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (None, 0, 0)).shape)
-        b_cta_crd = cluster_coord_mnk[0]
         sB_for_tma_partition = cute.group_modes(sB, 0, 2)
         gB_for_tma_partition = cute.group_modes(gB, 0, 2)
         tBsB, tBgB = cute.nvgpu.cpasync.tma_partition(
             tma_atom_b,
-            b_cta_crd,
-            b_cta_layout,
+            0,
+            cute.make_layout(1),
             sB_for_tma_partition,
             gB_for_tma_partition,
         )
         
+        # ===== mma thread partitioning memory spaces =====
+        tCgC = thr_mma.partition_C(gC)
+
         tCsA = thr_mma.partition_A(sA)
         tCsB = thr_mma.partition_B(sB)
         tCrA = tiled_mma.make_fragment_A(tCsA)
@@ -261,15 +250,13 @@ class Gemm_TC:
         acc_shape = tCgC.shape
         accumulators = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
 
-        num_k_blocks = cute.size(tCrA, mode=[2])
-
         tma_transaction_bytes = cute.size_in_bytes(
             self.a_dtype, a_smem_layout
         ) + cute.size_in_bytes(self.b_dtype, b_smem_layout)
 
         mbar_ptr = storage.mainloop_pipeline_array_ptr.data_ptr()
 
-        # Pipeline creation (cooperative model, matches dense_gemm.py)
+        # Pipeline creation (cooperative model)
         # Producer = warp 0 (issues TMA copies)
         # Consumer = all warps (participate in consumer_wait/release)
         num_warps = self.threads_per_cta // self.warp_size
@@ -279,7 +266,7 @@ class Gemm_TC:
             consumer_group=CooperativeGroup(Agent.Thread, num_warps),
             barrier_storage=mbar_ptr,
             tx_count=tma_transaction_bytes,
-            cta_layout_vmnk=cute.make_layout((1, *cta_layout_mnk.shape))
+            cta_layout_vmnk=cute.make_layout((1, 1, 1, 1))
         )
 
         producer_state = make_pipeline_state(PipelineUserType.Producer, self.num_stages)
@@ -288,7 +275,9 @@ class Gemm_TC:
 
         k_tile_cnt = mA_tma_tensor.shape[1] // self.BK
 
-        # =========== PREFETCH: warp 0 fills pipeline stages ===========
+        # ====== Main loop ======
+        
+        # Prefetch: warp 0 fills pipeline stages
         if warp_idx == 0:
             for kidx in range(self.num_stages):
                 mainloop_pipeline.producer_acquire(producer_state)
@@ -309,17 +298,17 @@ class Gemm_TC:
                 mainloop_pipeline.producer_commit(producer_state)
                 producer_state.advance()
 
-        # =========== MAINLOOP: all threads consume + warp 0 refills ===========
-        tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
+        # Mainloop: all threads consume + warp 0 refills
+        tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False) # accumulator fill(0) 
 
-        for kidx in range(k_tile_cnt):
+        for kidx in range(mA_tma_tensor.shape[1] // self.BK):
             # Wait for TMA load to complete for this stage
             mainloop_pipeline.consumer_wait(consumer_read_state)
 
             # WGMMA
             cute.nvgpu.warpgroup.fence()
 
-            for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
+            for k_block_idx in range(self.BK // self.tiled_mma.shape_mnk[2]):
                 k_block_coord = (None, None, k_block_idx, consumer_read_state.index)
                 tCrA_k = tCrA[k_block_coord]
                 tCrB_k = tCrB[k_block_coord]
@@ -361,7 +350,7 @@ class Gemm_TC:
                 mainloop_pipeline.producer_commit(producer_state)
                 producer_state.advance()
 
-        # =========== EPILOGUE: accumulators -> sC -> gmem ===========
+        # ====== Store results ======
         tv_layout_C_tiled = tiled_mma.tv_layout_C_tiled
 
         for reg_idx in range(cute.size(accumulators)):

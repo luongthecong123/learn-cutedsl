@@ -28,7 +28,6 @@ class Gemm_TC:
         assert self.num_stages == 1, "Only single-stage TMA is supported in this implementation"
         
         self.buffer_align_bytes = 1024
-        self.cluster_shape_mn = (1, 1)
         
     @cute.jit
     def __call__(
@@ -44,8 +43,6 @@ class Gemm_TC:
         self.b_layout = utils.LayoutEnum.from_tensor(b)
         self.c_layout = utils.LayoutEnum.from_tensor(c)
         
-        cta_layout_mnk = cute.make_layout((*self.cluster_shape_mn, 1))        
-
         # Create swizzled layout: S<3,4,3> o 0 o ((8,8),(64,1),(1,1)):((64,512),(1,0),(0,0))
         self.a_smem_layout_staged = sm90_utils.make_smem_layout_a(
             a_layout=self.a_layout,
@@ -147,7 +144,6 @@ class Gemm_TC:
             tma_atom_c,
             tma_tensor_c,
             tiled_mma,
-            cta_layout_mnk,
             c,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -167,13 +163,12 @@ class Gemm_TC:
         tma_atom_c: cute.CopyAtom,
         mC_tma_tensor: cute.Tensor,
         tiled_mma: cute.TiledMma,
-        cta_layout_mnk: cute.Layout,
         mC: cute.Tensor,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
         c_smem_layout_swizzled: cute.ComposedLayout,
     ):
-
+        # ====== Thread, Block setup =======
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
@@ -181,15 +176,10 @@ class Gemm_TC:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)  
 
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(
-            cute.arch.block_idx_in_cluster()
-        )
-        cluster_coord_mnk = cta_layout_mnk.get_flat_coord(cta_rank_in_cluster)
-
         bidx, bidy, _ = cute.arch.block_idx()
-        tid, _, _ = cute.arch.thread_idx()    
-        thr_mma = tiled_mma.get_slice(tid)
+        tid, _, _ = cute.arch.thread_idx()
 
+        # ===== Smem allocation and copy setup ======
         a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
         b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, 0))
 
@@ -228,27 +218,29 @@ class Gemm_TC:
             coord=(bidx, bidy, None),
             proj=(1, 1, None))
         
-        tCgC = thr_mma.partition_C(gC)
-        
-        a_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (0, None, 0)).shape)
-        a_cta_crd = cluster_coord_mnk[1]
+        # ===== TMA partition setup =====
+        sA_for_tma_partition = cute.group_modes(sA, 0, 2)
+        gA_for_tma_partition = cute.group_modes(gA, 0, 2)
         tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
             tma_atom_a,
-            a_cta_crd,
-            a_cta_layout,
-            cute.group_modes(sA, 0, 2),
-            cute.group_modes(gA, 0, 2),
+            0,
+            cute.make_layout(1),
+            sA_for_tma_partition,
+            gA_for_tma_partition,
         )
 
-        b_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (None, 0, 0)).shape)
-        b_cta_crd = cluster_coord_mnk[0]
+        sB_for_tma_partition = cute.group_modes(sB, 0, 2)
+        gB_for_tma_partition = cute.group_modes(gB, 0, 2)
         tBsB, tBgB = cute.nvgpu.cpasync.tma_partition(
             tma_atom_b,
-            b_cta_crd,
-            b_cta_layout,
-            cute.group_modes(sB, 0, 2),
-            cute.group_modes(gB, 0, 2),
+            0,
+            cute.make_layout(1),
+            sB_for_tma_partition,
+            gB_for_tma_partition,
         )
+        
+        # ===== mma thread partitioning memory spaces =====
+        thr_mma = tiled_mma.get_slice(tid)
         
         sA_mma = cute.slice_(sA, (None, None, 0))
         sB_mma = cute.slice_(sB, (None, None, 0))
@@ -260,9 +252,8 @@ class Gemm_TC:
         tCrA = tiled_mma.make_fragment_A(tCsA)
         tCrB = tiled_mma.make_fragment_B(tCsB)
         tCrC = tiled_mma.make_fragment_C(tCgC)
-
-        tCrC.fill(0.0)
         
+        # ====== Shared memory to register copy ======
         atom_copy_s2r_A = cute.make_copy_atom(
             cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False,num_matrices=4),
             self.a_dtype,
@@ -289,6 +280,9 @@ class Gemm_TC:
 
         mbar_ptr = storage.mainloop_pipeline_array_ptr.data_ptr()
 
+        # ====== Main loop ======
+        tCrC.fill(0.0)
+        
         for kidx in range(mA_mk.shape[1] // self.BK):
             if tid == 0:
                 cute.arch.mbarrier_init(mbar_ptr, cnt=1)
@@ -298,8 +292,10 @@ class Gemm_TC:
             
             if warp_idx == 0:
                 if tid == 0:
-                    cute.arch.mbarrier_expect_tx(mbar_ptr, tma_transaction_bytes)
-                    cute.arch.mbarrier_arrive(mbar_ptr)
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        mbar_ptr,
+                        tma_transaction_bytes,
+                    )
 
                 cute.copy(
                     tma_atom_a,
@@ -339,8 +335,8 @@ class Gemm_TC:
             
             cute.arch.sync_threads()
 
-        # ========== Option 1 ================
-        # Use StMatrixStore to store from register to smem, then TMA store to gmem
+        # ====== Store results ======
+        # Option 1: Use StMatrixStore to store from register to smem
         
         # tCrC_out = cute.make_fragment_like(tCrC, dtype=cutlass.Float16)
         

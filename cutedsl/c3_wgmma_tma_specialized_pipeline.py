@@ -38,7 +38,6 @@ class Gemm_TC:
 
         self.num_stages = 5
         self.buffer_align_bytes = 1024
-        self.cluster_shape_mn = (1, 1)
 
     @cute.jit
     def __call__(
@@ -54,8 +53,6 @@ class Gemm_TC:
         self.a_layout = utils.LayoutEnum.from_tensor(a)
         self.b_layout = utils.LayoutEnum.from_tensor(b)
         self.c_layout = utils.LayoutEnum.from_tensor(c)
-
-        cta_layout_mnk = cute.make_layout((*self.cluster_shape_mn, 1))
 
         self.a_smem_layout_staged = sm90_utils.make_smem_layout_a(
             a_layout=self.a_layout,
@@ -74,34 +71,32 @@ class Gemm_TC:
         tma_atom_a, tma_tensor_a = self._make_tma_atoms_and_tensors(
             a,
             self.a_smem_layout_staged,
-            (self.tile_shape_mnk[0], self.tile_shape_mnk[2]),
-            1,
+            (self.BM, self.BK)
         )
 
         tma_atom_b, tma_tensor_b = self._make_tma_atoms_and_tensors(
             b,
             self.b_smem_layout_staged,
-            (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
-            1,
+            (self.BN, self.BK)
         )
 
         c_smem_layout = cute.make_layout(
-            (self.tile_shape_mnk[0], self.tile_shape_mnk[1]),
-            stride=(self.tile_shape_mnk[1], 1)
+            (self.BM, self.BN),
+            stride=(self.BN, 1)
         )
 
         tma_atom_c, tma_tensor_c = cute.nvgpu.cpasync.make_tiled_tma_atom(
             cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(),
             c,
             c_smem_layout,
-            (self.tile_shape_mnk[0], self.tile_shape_mnk[1]),
+            (self.BM, self.BN),
         )
 
         
 
         # self.c_smem_layout = cute.make_layout(
-        #     (self.tile_shape_mnk[0], self.tile_shape_mnk[1]),
-        #     stride=(self.tile_shape_mnk[1], 1)
+        #     (self.BM, self.BN),
+        #     stride=(self.BN, 1)
         # )
 
         # self.c_smem_layout_swizzled = cute.make_composed_layout(
@@ -114,7 +109,7 @@ class Gemm_TC:
         #     cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(),
         #     c,
         #     self.c_smem_layout,
-        #     (self.tile_shape_mnk[0], self.tile_shape_mnk[1]),
+        #     (self.BM, self.BN),
         # )
 
         @cute.struct
@@ -131,7 +126,7 @@ class Gemm_TC:
                 self.buffer_align_bytes,
             ]
             sC: cute.struct.Align[
-                cute.struct.MemRange[self.c_dtype, self.tile_shape_mnk[0] * self.tile_shape_mnk[1]],
+                cute.struct.MemRange[self.c_dtype, self.BM * self.BN],
                 self.buffer_align_bytes,
             ]
 
@@ -144,7 +139,7 @@ class Gemm_TC:
             self.b_layout.sm90_mma_major_mode(),
             self.acc_dtype,
             self.atom_layout_mnk,
-            tiler_mn=(64, self.tile_shape_mnk[1]),
+            tiler_mn=(64, self.BN),
         )
 
         print("tiled_mma: ", self.tiled_mma)
@@ -158,7 +153,6 @@ class Gemm_TC:
             tma_atom_c,
             tma_tensor_c,
             self.tiled_mma,
-            cta_layout_mnk,
             c,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -177,18 +171,13 @@ class Gemm_TC:
         tma_atom_c: cute.CopyAtom,
         mC_tma_tensor: cute.Tensor,
         tiled_mma: cute.TiledMma,
-        cta_layout_mnk: cute.Layout,
         mC: cute.Tensor,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
     ):
+        # ====== Thread, Block setup =======
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
-
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(
-            cute.arch.block_idx_in_cluster()
-        )
-        cluster_coord_mnk = cta_layout_mnk.get_flat_coord(cta_rank_in_cluster)
 
         bidx, bidy, _ = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
@@ -202,6 +191,7 @@ class Gemm_TC:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)
 
+        # ===== Smem allocation and copy setup ======
         a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
         b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, 0))
 
@@ -225,50 +215,34 @@ class Gemm_TC:
 
         tile_coord_mnk = (bidx, bidy, None)
 
-        gA = cute.local_tile(
-            input=mA_tma_tensor,
-            tiler=self.tile_shape_mnk,
-            coord=tile_coord_mnk,
-            proj=(1, None, 1))
+        gA = cute.local_tile(mA_tma_tensor, self.tile_shape_mnk, tile_coord_mnk, (1, None, 1))
+        
+        gB = cute.local_tile(mB_tma_tensor, self.tile_shape_mnk, tile_coord_mnk, (None, 1, 1))
+        
+        gC = cute.local_tile(mC, self.tile_shape_mnk, tile_coord_mnk, (1, 1, None))
 
-        gB = cute.local_tile(
-            input=mB_tma_tensor,
-            tiler=self.tile_shape_mnk,
-            coord=tile_coord_mnk,
-            proj=(None, 1, 1))
-
-        gC = cute.local_tile(
-            input=mC,
-            tiler=self.tile_shape_mnk,
-            coord=tile_coord_mnk,
-            proj=(1, 1, None))
-
-        # TMA partitions
-        a_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (0, None, 0)).shape)
-        a_cta_crd = cluster_coord_mnk[1]
+        # ===== TMA partition setup =====
         sA_for_tma_partition = cute.group_modes(sA, 0, 2)
         gA_for_tma_partition = cute.group_modes(gA, 0, 2)
         tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
             tma_atom_a,
-            a_cta_crd,
-            a_cta_layout,
+            0,
+            cute.make_layout(1),
             sA_for_tma_partition,
             gA_for_tma_partition,
         )
 
-        b_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (None, 0, 0)).shape)
-        b_cta_crd = cluster_coord_mnk[0]
         sB_for_tma_partition = cute.group_modes(sB, 0, 2)
         gB_for_tma_partition = cute.group_modes(gB, 0, 2)
         tBsB, tBgB = cute.nvgpu.cpasync.tma_partition(
             tma_atom_b,
-            b_cta_crd,
-            b_cta_layout,
+            0,
+            cute.make_layout(1),
             sB_for_tma_partition,
             gB_for_tma_partition,
         )
 
-        # MMA partitions: threads 0-127 are MMA, tidx maps directly to tiled_mma
+        # ===== mma thread partitioning memory spaces =====
         warp_group_idx = cute.arch.make_warp_uniform(
             tidx // self.num_threads_per_warp_group
         )
@@ -288,8 +262,6 @@ class Gemm_TC:
         acc_shape = tCgC.shape
         accumulators = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
 
-        num_k_blocks = cute.size(tCrA, mode=[2])
-
         tma_transaction_bytes = cute.size_in_bytes(
             self.a_dtype, a_smem_layout
         ) + cute.size_in_bytes(self.b_dtype, b_smem_layout)
@@ -304,16 +276,16 @@ class Gemm_TC:
             consumer_group=CooperativeGroup(Agent.Thread, num_consumer_warps),
             barrier_storage=mbar_ptr,
             tx_count=tma_transaction_bytes,
-            cta_layout_vmnk=cute.make_layout((1, *cta_layout_mnk.shape))
+            cta_layout_vmnk=cute.make_layout((1, 1, 1, 1))
         )
 
         producer_state = make_pipeline_state(PipelineUserType.Producer, self.num_stages)
         consumer_read_state = make_pipeline_state(PipelineUserType.Consumer, self.num_stages)
         consumer_release_state = make_pipeline_state(PipelineUserType.Consumer, self.num_stages)
 
-        k_tile_cnt = mA_tma_tensor.shape[1] // self.BK
+        # ====== Main loop ======
 
-        # =========== TMA WARP (producer) ===========
+        # TMA warp (producer)
         if is_tma_warp:
             # Prefetch: fill all pipeline stages
             for kidx in range(self.num_stages):
@@ -336,7 +308,7 @@ class Gemm_TC:
                 producer_state.advance()
 
             # Continue producing for remaining K tiles
-            for kidx in range(self.num_stages, k_tile_cnt):
+            for kidx in range(self.num_stages, mA_tma_tensor.shape[1] // self.BK):
                 mainloop_pipeline.producer_acquire(producer_state)
 
                 cute.copy(
@@ -355,16 +327,16 @@ class Gemm_TC:
                 mainloop_pipeline.producer_commit(producer_state)
                 producer_state.advance()
 
-        # =========== MMA WARPs (consumer) ===========
+        # MMA warps (consumer)
         if is_mma_warp:
-            tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
+            tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)  # accumulator fill(0)
 
-            for kidx in range(k_tile_cnt):
+            for kidx in range(mA_tma_tensor.shape[1] // self.BK):
                 mainloop_pipeline.consumer_wait(consumer_read_state)
 
                 cute.nvgpu.warpgroup.fence()
 
-                for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
+                for k_block_idx in range(self.BK // self.tiled_mma.shape_mnk[2]):
                     cute.gemm(
                         tiled_mma,
                         accumulators,
@@ -381,8 +353,9 @@ class Gemm_TC:
                 consumer_read_state.advance()
                 consumer_release_state.advance()
 
-        # =========== EPILOGUE: accumulators -> sC -> gmem ===========
-        # Only MMA warp group writes accumulators to sC
+        # ====== Store results ======
+        
+        # MMA warp group writes accumulators to sC
         if is_mma_warp:
             tv_layout_C_tiled = tiled_mma.tv_layout_C_tiled
 
@@ -421,22 +394,15 @@ class Gemm_TC:
     def _make_tma_atoms_and_tensors(
         tensor: cute.Tensor,
         smem_layout_staged: cute.ComposedLayout,
-        smem_tile: tuple[int, int],
-        mcast_dim: int,
+        smem_tile: tuple[int, int]
     ) -> tuple[cute.CopyAtom, cute.Tensor]:
-        op = (
-            cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
-            if mcast_dim == 1
-            else cute.nvgpu.cpasync.CopyBulkTensorTileG2SMulticastOp()
-        )
-
+        op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
         smem_layout = cute.slice_(smem_layout_staged, (None, None, 0))
         tma_atom, tma_tensor = cute.nvgpu.cpasync.make_tiled_tma_atom(
             op,
             tensor,
             smem_layout,
-            smem_tile,
-            num_multicast=mcast_dim,
+            smem_tile
         )
         return tma_atom, tma_tensor
 
