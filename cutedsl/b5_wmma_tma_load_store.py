@@ -283,20 +283,20 @@ class Gemm_TC:
         # ====== Main loop ======
         tCrC.fill(0.0)
         
+        if warp_idx == 0 and tid == 0:
+            # Set expected arrival count for mbarrier, TMA is issued by only 1 thread, so the count is 1
+            cute.arch.mbarrier_init(mbar_ptr, cnt=1)
+            cute.arch.mbarrier_init_fence()
+        # Make sure the mbarrier initialization is visible to all threads    
+        cute.arch.sync_threads()
+        
+        # Signal that the phase/TMA is complete
+        # Readers can check my previous commit where I didn't use phase
+        phase = 0
+        
         for kidx in range(mA_mk.shape[1] // self.BK):
-            if tid == 0:
-                cute.arch.mbarrier_init(mbar_ptr, cnt=1)
-                cute.arch.mbarrier_init_fence()
-            
-            cute.arch.sync_threads()
-            
+            # I think cute launches using a single thread under the hood, so here if we use only one thread to call the copy, it will cause a deadlock. Hence we call it using the first warp instead.
             if warp_idx == 0:
-                if tid == 0:
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        mbar_ptr,
-                        tma_transaction_bytes,
-                    )
-
                 cute.copy(
                     tma_atom_a,
                     tAgA[None, kidx],
@@ -310,8 +310,20 @@ class Gemm_TC:
                     tBsB[None, 0],
                     tma_bar_ptr=mbar_ptr
                 )
+                
+                if tid == 0:
+                    # Track how bytes have been transferred with mbarrier
+                    # When both arrival count above and expected bytes reach zero, the barrier is released and move on to the next phase
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        mbar_ptr,
+                        tma_transaction_bytes,
+                    )                
 
-            cute.arch.mbarrier_wait(mbar_ptr, 0)
+            # cute.arch.sync_threads()
+            cute.arch.mbarrier_wait(mbar_ptr, phase)
+            
+            # Flip the phase using XOR
+            phase ^= 1
 
             cute.copy(
                 atom=tiled_copy_s2r_A,
@@ -357,6 +369,7 @@ class Gemm_TC:
         # tCrC_copy_view = thr_copy_stmatrix_C.retile(tCrC_out)
         # tCsC_copy_view = thr_copy_stmatrix_C.partition_D(sC)
         
+        # # Copy from rmem to smem with StMatrixStore
         # cute.copy(
         #     atom=tiled_copy_r2s_C,
         #     src=tCrC_copy_view,
@@ -375,7 +388,7 @@ class Gemm_TC:
         #     sC[m_local, n_local] = cutlass.Float16(tCrC[reg_idx])
         
         ## ========== TMA Store ================
-        ## TMA store from smem to gmem for both option 1 and 2
+        # TMA store from smem to gmem after option 1 and 2
 
         # cute.arch.sync_threads()
         # cute.arch.fence_proxy("async.shared", space="cta")
@@ -398,6 +411,7 @@ class Gemm_TC:
         #     gC_for_tma_partition,
         # )
         
+        # # smem -> gmem copy using TMA
         # if warp_idx == 0:
         #     cute.copy(tma_atom_c, tCsC, tCgC_store)
 

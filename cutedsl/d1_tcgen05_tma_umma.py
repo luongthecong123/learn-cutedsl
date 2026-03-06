@@ -170,10 +170,10 @@ class Gemm_TC:
         gC = cute.local_tile(mC, self.mma_tiler_mnk, mma_coord_mnk, proj=(1, 1, None))
 
         # tcgen05: single-thread partitioning (not warp-group based like WGMMA)
-        thr_mma = tiled_mma.get_slice(0)
-        tCgA = thr_mma.partition_A(gA)   # (MMA, MMA_M, MMA_K, RestK)
-        tCgB = thr_mma.partition_B(gB)   # (MMA, MMA_N, MMA_K, RestK)
-        tCgC = thr_mma.partition_C(gC)   # (MMA, MMA_M, MMA_N)
+        thr_mma = tiled_mma.get_slice(thr_idx=0)
+        tCgA = thr_mma.partition_A(gA)
+        tCgB = thr_mma.partition_B(gB)
+        tCgC = thr_mma.partition_C(gC)
 
         # Fragments: A/B read directly from SMEM (tcgen05 MMA reads SMEM, not registers)
         tCrA = tiled_mma.make_fragment_A(sA)  # (MMA, MMA_M, MMA_K)
@@ -244,7 +244,7 @@ class Gemm_TC:
         tiled_mma.set(tcgen05.Field.ACCUMULATE, False)# acc = 0
     
         if warp_idx == 0 and tidx == 0:
-            # Set expected arrival count for mbarrier, TMA is issued by only 1 thread, so the count is 1
+            # Set expected arrival count for mbarrier, TMA is issued by only 1 thread, so the count is 1, same for UMMA
             cute.arch.mbarrier_init(tma_mbar, cnt=1)
             cute.arch.mbarrier_init(mma_mbar, cnt=1)
             cute.arch.mbarrier_init_fence()
@@ -254,10 +254,10 @@ class Gemm_TC:
         # Signal that the phase/TMA/mma is complete
         tma_phase = 0
         mma_phase = 0
-        
-        # cute launches tma and umma using a single thread under the hood, so here if we use only one thread to call the copy, it will cause a deadlock. Hence we call it using the first warp instead.
-        if warp_idx == 0:   
-            for kidx in range(mA_tma_tensor.shape[1] // self.BK):
+    
+        for kidx in range(mA_tma_tensor.shape[1] // self.BK):
+            # cute launches tma and umma using a single thread under the hood, so here if we use only one thread to call the op, it will cause a deadlock. Hence we call it using the first warp instead.
+            if warp_idx == 0:
                 cute.copy(
                     tma_atom_a,
                     tAgA[None, kidx],
@@ -280,16 +280,16 @@ class Gemm_TC:
                         tma_transaction_bytes,
                     )                
 
-                # cute.arch.sync_threads()
-                cute.arch.mbarrier_wait(tma_mbar, tma_phase)
-                
-                # Flip the phase using XOR
-                tma_phase ^= 1
-                
-                _ = tcgen05_fence()
+            cute.arch.mbarrier_wait(tma_mbar, tma_phase)
+            
+            # Flip the phase using XOR
+            tma_phase ^= 1
+            
+            _ = tcgen05_fence()
 
-                num_k_blocks = cute.size(tCrA, mode=[2])
+            num_k_blocks = cute.size(tCrA, mode=[2])
 
+            if warp_idx == 0:
                 for k_block_idx in range(num_k_blocks):
                     k_block_coord = (None, None, k_block_idx, 0)
                     cute.gemm(
@@ -303,17 +303,16 @@ class Gemm_TC:
                     
                 if tidx == 0:    
                     tcgen05.commit(mma_mbar)
-                    
-                cute.arch.mbarrier_wait(mma_mbar, mma_phase)
-                mma_phase ^= 1
+                
+            cute.arch.mbarrier_wait(mma_mbar, mma_phase)
+            mma_phase ^= 1
 
 
         # ====== Epilogue: TMEM → RMEM → GMEM ======
 
         # Release TMEM allocation lock
         tmem.relinquish_alloc_permit()
-
-        cute.arch.sync_threads()
+        # cute.arch.sync_threads()
 
         # Sub-tiled TMEM → RMEM → GMEM copy (all threads participate)
         for i in cutlass.range(cute.size(tDtC, mode=[2])):
@@ -322,7 +321,6 @@ class Gemm_TC:
             cute.autovec_copy(tCrC, tDgC[None, None, i])
 
         # Deallocate TMEM
-        pipeline.sync(barrier_id=1)
         tmem.free(tmem_ptr)
 
 
