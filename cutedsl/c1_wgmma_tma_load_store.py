@@ -12,7 +12,7 @@ from cutlass.cute.testing import benchmark, JitArguments
 class Gemm_TC:
     def __init__(
         self,
-        cta_tiler: Tuple[int, int, int] = (64, 128, 64),
+        cta_tiler: Tuple[int, int, int] = (128, 128, 128),
     ):
         self.tile_shape_mnk = cta_tiler
         self.BM, self.BN, self.BK = self.tile_shape_mnk
@@ -110,12 +110,12 @@ class Gemm_TC:
                 ],
                 self.buffer_align_bytes,
             ]
-            sC: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.c_dtype, self.BM * self.BN
-                ],
-                self.buffer_align_bytes,
-            ]
+            # sC: cute.struct.Align[
+            #     cute.struct.MemRange[
+            #         self.c_dtype, self.BM * self.BN
+            #     ],
+            #     self.buffer_align_bytes,
+            # ]
 
         self.shared_storage = SharedStorage
 
@@ -213,7 +213,9 @@ class Gemm_TC:
             (self.BM, self.BN),
             stride=(self.BN, 1)
         )
-        sC = storage.sC.get_tensor(c_smem_layout)
+        
+        # Reuse sA smem as sC
+        sC = storage.sA.get_tensor(c_smem_layout)
 
         sA_for_tma_partition = cute.group_modes(sA, 0, 2)
         gA_for_tma_partition = cute.group_modes(gA, 0, 2)
@@ -358,9 +360,9 @@ class Gemm_TC:
         
         for reg_idx in range(cute.size(accumulators)):
             coord = cute.idx2crd((tidx, reg_idx), tv_layout_C_tiled.shape)
-            mn_local_tile_flat = cute.crd2idx(coord, tv_layout_C_tiled)
-            m_local, n_local = cute.idx2crd(mn_local_tile_flat, c_smem_layout.shape)
-            sC[m_local, n_local] = cutlass.Float16(accumulators[reg_idx])
+            mn_tile_flat = cute.crd2idx(coord, tv_layout_C_tiled)
+            m, n = cute.idx2crd(mn_tile_flat, c_smem_layout.shape)
+            sC[m, n] = cutlass.Float16(accumulators[reg_idx])
         
         # TMA store from smem to gmem for both option 1 and 2
         cute.arch.sync_threads()
@@ -389,7 +391,7 @@ class Gemm_TC:
 
         # Option 3: directly store from register to gmem
         
-        # # Can't use tCgC because it was partitioned using warp group
+        # Can't use tCgC because it was partitioned using warp group
         # thr_mma_store = tiled_mma.get_slice(tidx)
         # tCgC_store = thr_mma_store.partition_C(gC)
 
@@ -407,7 +409,7 @@ class Gemm_TC:
         #     atom=atom_universal,
         #     src=tCrC_out,
         #     dst=tCgC_store  # Use the correctly partitioned tensor
-        # )        
+        # )      
 
     @staticmethod
     def _make_tma_atoms_and_tensors(

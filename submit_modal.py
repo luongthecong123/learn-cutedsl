@@ -34,23 +34,20 @@ def run_kernel_sm120():
 
 @app.function(gpu="H100")
 def run_kernel_sm90():
-    # print("SM90 b2_wmma_smem.py")
-    # from cutedsl.b2_wmma_smem import main
-    # main()
-    # print("SM90 b5_wmma_tma_load_store.py")
-    # from cutedsl.b5_wmma_tma_load_store import main
-    # main()
-    # print("SM90 b6_wmma_colwise_scaling.py")
-    # from cutedsl.b6_wmma_colwise_scaling import main
-    # main()
+    print("SM90 b2_wmma_smem.py")
+    from cutedsl.b2_wmma_smem import main
+    main()
+    print("SM90 b5_wmma_tma_load_store.py")
+    from cutedsl.b5_wmma_tma_load_store import main
+    main()
+    print("SM90 b6_wmma_colwise_scaling.py")
+    from cutedsl.b6_wmma_colwise_scaling import main
+    main()
     print("SM90 c1_wgmma_tma_load_store.py")
     from cutedsl.c1_wgmma_tma_load_store import main
     main()
-    # print("SM90 c2_wgmma_tma_pipeline.py")
-    # from cutedsl.c2_wgmma_tma_pipeline import main
-    # main()
     print("SM90 c3_wgmma_tma_specialized_pipeline.py")
-    from cutedsl.c3_wgmma_tma_specialized_pipeline import main
+    from cutedsl.c2_wgmma_tma_specialized_pipeline import main
     main()
 
 @app.function(gpu="B200")
@@ -61,9 +58,9 @@ def run_kernel_sm100():
 
 @app.local_entrypoint()
 def main():
-    run_kernel_sm80.remote()
+    # run_kernel_sm80.remote()
     run_kernel_sm90.remote()
     run_kernel_sm100.remote()
-    run_kernel_sm120.remote()
+    # run_kernel_sm120.remote()
     
     

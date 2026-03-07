@@ -43,21 +43,20 @@ Suggested progression:
 
 6. **Blackwell tcgen05 (d-series)** — the next generation matrix instruction on SM100/SM120.
 
-**FLOPS progression** (M=N=K=4096, dtype=float16, measured on H100):
+**FLOPS progression** (M=N=K=4096, dtype=float16, measured on H100 (a-c) and B200 (d)):
 
 | Stage | Script | Architecture | TFLOPS |
 |---|---|---|---|
 | Naïve GEMM | [`a1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute.py) | Any | 0.58 |
 | Shared memory GEMM | [`a2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a2_smem_cuda_like.py) | Any | 7.17 |
-| WMMA tensor cores + SMEM | [`b2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b2_wmma_smem.py) | Ampere+ (SM80+) | 145.49 |
-| WMMA + TMA load/store | [`b5`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b5_wmma_tma_load_store.py) | Hopper+ (SM90+) | 203.80 |
-| WGMMA + TMA load/store | [`c1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c1_wgmma_tma_load_store.py) | Hopper (SM90) | 446.14 |
-| WGMMA + TMA pipeline | [`c2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c2_wgmma_tma_pipeline.py) | Hopper (SM90) | 515.15 |
-| WGMMA + TMA warp-specialized pipeline | [`c3`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c3_wgmma_tma_specialized_pipeline.py) | Hopper (SM90) | 600.45 |
-| tcgen05 + TMA | [`d1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/d1_tcgen05_tma.py) | Blackwell (SM100) | TBD |
-| tcgen05 + TMA specialized pipeline | `d2` | Blackwell (SM100) | TBD |
+| WMMA tensor cores + SMEM | [`b2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b2_wmma_smem.py) | Ampere+ (SM80+) | 144.48 |
+| WMMA + TMA load/store | [`b5`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b5_wmma_tma_load_store.py) | Hopper+ (SM90+) | 198.71 |
+| WGMMA + TMA load/store | [`c1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c1_wgmma_tma_load_store.py) | Hopper (SM90) | 532.10 |
+| WGMMA + TMA warp-specialized pipeline | [`c1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c2_wgmma_tma_specialized_pipeline.py) | Hopper (SM90) | 685.08 |
+| TMA + tcgen05 UMMA | [`d1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/d1_tcgen05_tma_umma.py) | Blackwell (SM100) | 709.84 |
+| TMA + tcgen05 UMMA warp-specialized pipeline | `d2` | Blackwell (SM100) | TBD |
 
-We can improve further by using techniques such as Persistent kernel to overlap epilogue with the start of the next tile, TMA Multicast, Larger tile size through register pressure management, TMEM staging in Blackwell,... to reach Speed of Light which is around 720 TFLOPS for H100 and 1500 TFLOPS for B200.
+We can improve further by using techniques such as Persistent kernel to overlap epilogue with the start of the next tile, TMA Multicast, TMEM staging in Blackwell,... to reach Speed of Light (CuBLAS) which is around 720 TFLOPS for H100 and 1500 TFLOPS for B200.
 
 </details>
 
@@ -951,6 +950,7 @@ ray job submit \
 ```
 
 **Using Modal:**
+Recommended approach: they gives 30$ credit upon account creation, each run costs 10 cents, and I love using Modal (this repo is not sponsored by Modal :))
 ```bash
 pip install modal
 python3 -m modal setup
@@ -970,3 +970,4 @@ modal run submit_modal.py
 8. https://github.com/LeiWang1999/CPPTorchExecutable
 9. https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/overview.html
 10. https://research.colfax-intl.com/cutlass-tutorial-writing-gemm-kernels-using-tensor-memory-for-nvidia-blackwell-gpus/
+11. https://veitner.bearblog.dev/persistent-gemm-in-cutedsl-on-hopper/

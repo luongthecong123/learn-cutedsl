@@ -29,7 +29,7 @@ def tcgen05_fence(*, loc=None, ip=None) -> cutlass.Int32:
 class Gemm_TC:
     def __init__(
         self,
-        mma_tiler_mnk: Tuple[int, int, int] = (128, 256, 64),
+        mma_tiler_mnk: Tuple[int, int, int] = (128, 256, 256), # or faster with (128, 512, 256)
         mma_inst_shape_mnk: Tuple[int, int, int] = (128, 256, 16),
     ):
         self.mma_tiler_mnk = mma_tiler_mnk
@@ -85,6 +85,12 @@ class Gemm_TC:
             op_g2s, b, b_smem_layout_one_stage, self.mma_tiler_mnk, self.tiled_mma,
         )
 
+        # cta_tile_shape_mnk for epilogue copy atom selection (no 2cta, so M is full)
+        self.cta_tile_shape_mnk = self.mma_tiler_mnk
+
+        # c layout enum for get_tmem_load_op
+        self.c_layout = utils.LayoutEnum.from_tensor(c)
+
         # Shared storage: barriers + TMEM allocation tracking
         # (SMEM tensors for A/B are allocated separately via SmemAllocator)
         @cute.struct
@@ -130,6 +136,11 @@ class Gemm_TC:
         bidx, bidy, _ = cute.arch.block_idx()
         mma_coord_mnk = (bidx, bidy, None)
 
+        # Prefetch TMA descriptors
+        if warp_idx == 0:
+            cpasync.prefetch_descriptor(tma_atom_a)
+            cpasync.prefetch_descriptor(tma_atom_b)
+
         # ====== SMEM allocation ======
         # Allocated independently from SharedStorage (sm100 style)
         smem = cutlass.utils.SmemAllocator()
@@ -147,7 +158,7 @@ class Gemm_TC:
             swizzle=b_smem_layout.inner,
         )
 
-        # ====== TMEM allocation ======
+        # ====== TMEM ======
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=1,
             num_threads=self.threads_per_cta,
@@ -156,13 +167,6 @@ class Gemm_TC:
             storage.tmem_holding_buf,
             barrier_for_retrieve=tmem_alloc_barrier,
         )
-        num_tmem_cols = 512
-        tmem.allocate(num_tmem_cols)
-
-        # Prefetch TMA descriptors
-        if warp_idx == 0:
-            cpasync.prefetch_descriptor(tma_atom_a)
-            cpasync.prefetch_descriptor(tma_atom_b)
 
         # ====== Partition tensors for MMA ======
         gA = cute.local_tile(mA_tma_tensor, self.mma_tiler_mnk, mma_coord_mnk, proj=(1, None, 1))
@@ -175,13 +179,17 @@ class Gemm_TC:
         tCgB = thr_mma.partition_B(gB)
         tCgC = thr_mma.partition_C(gC)
 
-        # Fragments: A/B read directly from SMEM (tcgen05 MMA reads SMEM, not registers)
-        tCrA = tiled_mma.make_fragment_A(sA)  # (MMA, MMA_M, MMA_K)
-        tCrB = tiled_mma.make_fragment_B(sB)  # (MMA, MMA_N, MMA_K)
+        # Fragments: A/B read directly from SMEM
+        tCrA = tiled_mma.make_fragment_A(sA)
+        tCrB = tiled_mma.make_fragment_B(sB)
 
-        # Accumulator lives in TMEM (not registers like WGMMA)
+        # Accumulator lives in TMEM
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler_mnk[:2])
-        tCtAcc = tiled_mma.make_fragment_C(acc_shape)  # (MMA, MMA_M, MMA_N)
+        tCtAcc = tiled_mma.make_fragment_C(acc_shape)
+
+        num_tmem_cols = utils.get_num_tmem_alloc_cols(tCtAcc)
+        print("num_tmem_cols: ", num_tmem_cols)
+        tmem.allocate(num_tmem_cols)
 
         # ====== TMA partition (through MMA partitioning) ======
         tAsA, tAgA = cpasync.tma_partition(
@@ -204,28 +212,37 @@ class Gemm_TC:
         tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc.layout)
 
         # ====== Epilogue setup: TMEM → RMEM → GMEM ======
-        # Sub-tile the accumulator for better instruction-level parallelism
-        subtile_cnt = 4
-        epi_tiler = (
-            (cute.size(tCtAcc, mode=[0, 0]),
-             cute.size(tCtAcc, mode=[0, 1]) // subtile_cnt),
+        # Delegate copy atom selection to sm100_utils — picks Ld32x32bOp repetition
+        # based on tile shape, c_layout, dtypes; subtile_cnt derived from partition shape
+        epi_tile = self.cta_tile_shape_mnk[:2]
+        copy_atom_t2r = sm100_utils.get_tmem_load_op(
+            self.cta_tile_shape_mnk,
+            self.c_layout,
+            self.io_dtype,
+            self.acc_dtype,
+            epi_tile,
+            False,  # use_2cta_instrs
         )
-        tCtAcc_epi = cute.zipped_divide(tCtAcc, epi_tiler)  # (EpiTile, NumTiles)
-        gC_epi = cute.zipped_divide(tCgC, epi_tiler)         # (EpiTile, NumTiles)
-
-        # Every thread loads 64 x fp32 from TMEM
-        tmem_atom = cute.make_copy_atom(
-            tcgen05.Ld32x32bOp(tcgen05.Repetition.x64),
-            cutlass.Float32,
-        )
-        tmem_tiled_copy = tcgen05.make_tmem_copy(tmem_atom, tCtAcc_epi[None, 0])
+        # (EPI_TILE_M, EPI_TILE_N)
+        tAcc_epi = cute.flat_divide(tCtAcc[((None, None), 0, 0)], epi_tile)
+        tmem_tiled_copy = tcgen05.make_tmem_copy(copy_atom_t2r, tAcc_epi[(None, None, 0, 0)])
         tmem_thr_copy = tmem_tiled_copy.get_slice(tidx)
 
-        tDtC = tmem_thr_copy.partition_S(tCtAcc_epi)  # (TmemCpy, NumTmemCpy, NumTiles)
-        tDgC = tmem_thr_copy.partition_D(gC_epi)       # (TmemCpy, NumTmemCpy, NumTiles)
+        # (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
+        tTR_tAcc = tmem_thr_copy.partition_S(tAcc_epi)
+        # tCgC is (MMA, MMA_M, MMA_N) — rank 3, mma_coord already applied via local_tile
+        tCgC_epi = cute.flat_divide(tCgC[((None, None), 0, 0)], epi_tile)
+        # (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
+        tTR_gC = tmem_thr_copy.partition_D(tCgC_epi)
+        # (T2R, T2R_M, T2R_N)
+        tTR_rAcc = cute.make_rmem_tensor(tTR_gC[(None, None, None, 0, 0)].shape, self.acc_dtype)
+        tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.io_dtype)
 
-        tCrAcc = cute.make_rmem_tensor(tDgC[None, None, 0].shape, self.acc_dtype)
-        tCrC = cute.make_rmem_tensor(tDgC[None, None, 0].shape, self.io_dtype)
+        # Group trailing dims; subtile_cnt falls out of partition shape (mode 3)
+        tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+        tTR_gC = cute.group_modes(tTR_gC, 3, cute.rank(tTR_gC))
+
+        simt_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.io_dtype)
 
         # ====== Barrier setup ======
         tma_mbar = storage.tma_mbar_ptr.data_ptr()
@@ -238,23 +255,20 @@ class Gemm_TC:
         )
 
         # ====== Main loop (only warp 0 does TMA + MMA) ======
-        num_k_tiles = cute.size(gA, mode=[2])
-
-        
         tiled_mma.set(tcgen05.Field.ACCUMULATE, False)# acc = 0
-    
+
         if warp_idx == 0 and tidx == 0:
             # Set expected arrival count for mbarrier, TMA is issued by only 1 thread, so the count is 1, same for UMMA
             cute.arch.mbarrier_init(tma_mbar, cnt=1)
             cute.arch.mbarrier_init(mma_mbar, cnt=1)
             cute.arch.mbarrier_init_fence()
-        # Make sure the mbarrier initialization is visible to all threads    
+        # Make sure the mbarrier initialization is visible to all threads
         cute.arch.sync_threads()
-        
+
         # Signal that the phase/TMA/mma is complete
         tma_phase = 0
         mma_phase = 0
-    
+
         for kidx in range(mA_tma_tensor.shape[1] // self.BK):
             # cute launches tma and umma using a single thread under the hood, so here if we use only one thread to call the op, it will cause a deadlock. Hence we call it using the first warp instead.
             if warp_idx == 0:
@@ -264,27 +278,27 @@ class Gemm_TC:
                     tAsA[None, 0],
                     tma_bar_ptr=tma_mbar
                 )
-                
+
                 cute.copy(
                     tma_atom_b,
                     tBgB[None, kidx],
                     tBsB[None, 0],
                     tma_bar_ptr=tma_mbar
                 )
-                
+
                 if tidx == 0:
                     # Track how bytes have been transferred with mbarrier
                     # When both arrival count above and expected bytes reach zero, the barrier is released and move on to the next phase
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         tma_mbar,
                         tma_transaction_bytes,
-                    )                
+                    )
 
             cute.arch.mbarrier_wait(tma_mbar, tma_phase)
-            
+
             # Flip the phase using XOR
             tma_phase ^= 1
-            
+
             _ = tcgen05_fence()
 
             num_k_blocks = cute.size(tCrA, mode=[2])
@@ -300,25 +314,24 @@ class Gemm_TC:
                         tCtAcc,
                     )
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                    
-                if tidx == 0:    
+
+                if tidx == 0:
                     tcgen05.commit(mma_mbar)
-                
+
             cute.arch.mbarrier_wait(mma_mbar, mma_phase)
             mma_phase ^= 1
-
 
         # ====== Epilogue: TMEM → RMEM → GMEM ======
 
         # Release TMEM allocation lock
         tmem.relinquish_alloc_permit()
-        # cute.arch.sync_threads()
 
-        # Sub-tiled TMEM → RMEM → GMEM copy (all threads participate)
-        for i in cutlass.range(cute.size(tDtC, mode=[2])):
-            cute.copy(tmem_tiled_copy, tDtC[None, None, i], tCrAcc)
-            tCrC.store(tCrAcc.load().to(self.io_dtype))
-            cute.autovec_copy(tCrC, tDgC[None, None, i])
+        # subtile_cnt derived from partition shape (mode 3)
+        subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+        for subtile_idx in cutlass.range(subtile_cnt):
+            cute.copy(tmem_tiled_copy, tTR_tAcc[(None, None, None, subtile_idx)], tTR_rAcc)
+            tTR_rC.store(tTR_rAcc.load().to(self.io_dtype))
+            cute.copy(simt_atom, tTR_rC, tTR_gC[(None, None, None, subtile_idx)])
 
         # Deallocate TMEM
         tmem.free(tmem_ptr)
