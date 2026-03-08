@@ -13,12 +13,12 @@ import torch
 class Gemm_TC:
     def __init__(
         self,
-        cta_tiler: Tuple[int, int, int] = (64, 64, 64),
+        cta_tiler: Tuple[int, int, int] = (128, 128, 64),
     ):
         self.tile_shape_mnk = cta_tiler
         self.BM, self.BN, self.BK = self.tile_shape_mnk
         self.mma_inst_shape = (16, 8, 16)
-        self.atom_layout_mnk = (4, 4, 1)
+        self.atom_layout_mnk = (2, 2, 1)
         self.warp_size = cute.arch.WARP_SIZE
         self.threads_per_cta = self.warp_size * self.atom_layout_mnk[0] * self.atom_layout_mnk[1]
         assert self.BM % 16 == 0, "bM must be divisible by 16"
@@ -469,7 +469,7 @@ def main():
     B_ = from_dlpack(B, assumed_align=16)
     C_ = from_dlpack(C, assumed_align=16)
 
-    gemm = Gemm_TC(cta_tiler=(64, 64, 64))
+    gemm = Gemm_TC()
     compiled = cute.compile(gemm, A_, B_, C_)
     compiled(A_, B_, C_)
 

@@ -29,7 +29,7 @@ def tcgen05_fence(*, loc=None, ip=None) -> cutlass.Int32:
 class Gemm_TC:
     def __init__(
         self,
-        mma_tiler_mnk: Tuple[int, int, int] = (128, 256, 256), # or faster with (128, 512, 256)
+        mma_tiler_mnk: Tuple[int, int, int] = (128, 256, 256), # or faster with (128, 512, 128)
         mma_inst_shape_mnk: Tuple[int, int, int] = (128, 256, 16),
     ):
         self.mma_tiler_mnk = mma_tiler_mnk
@@ -215,6 +215,7 @@ class Gemm_TC:
         # Delegate copy atom selection to sm100_utils — picks Ld32x32bOp repetition
         # based on tile shape, c_layout, dtypes; subtile_cnt derived from partition shape
         epi_tile = self.cta_tile_shape_mnk[:2]
+        print("epi_tile: ", epi_tile)
         copy_atom_t2r = sm100_utils.get_tmem_load_op(
             self.cta_tile_shape_mnk,
             self.c_layout,

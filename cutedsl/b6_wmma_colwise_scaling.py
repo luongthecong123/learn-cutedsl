@@ -279,7 +279,7 @@ def main():
     c_ = from_dlpack(c, assumed_align=16)
     r_ = from_dlpack(r, assumed_align=16)
 
-    gemm = Gemm_TC(cta_tiler=(64, 64, 64))
+    gemm = Gemm_TC()
     compiled = cute.compile(gemm, a_, b_, c_, r_)
     compiled(a_, b_, c_, r_)
 

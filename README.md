@@ -43,18 +43,19 @@ Suggested progression:
 
 6. **Blackwell tcgen05 (d-series)** — the next generation matrix instruction on SM100/SM120.
 
-**FLOPS progression** (M=N=K=4096, dtype=float16, measured on H100 (a-c) and B200 (d)):
+**FLOPS progression** (M=N=K=4096, dtype=float16):
 
-| Stage | Script | Architecture | TFLOPS |
-|---|---|---|---|
-| Naïve GEMM | [`a1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute.py) | Any | 0.58 |
-| Shared memory GEMM | [`a2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a2_smem_cuda_like.py) | Any | 7.17 |
-| WMMA tensor cores + SMEM | [`b2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b2_wmma_smem.py) | Ampere+ (SM80+) | 144.48 |
-| WMMA + TMA load/store | [`b5`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b5_wmma_tma_load_store.py) | Hopper+ (SM90+) | 198.71 |
-| WGMMA + TMA load/store | [`c1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c1_wgmma_tma_load_store.py) | Hopper (SM90) | 532.10 |
-| WGMMA + TMA warp-specialized pipeline | [`c1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c2_wgmma_tma_specialized_pipeline.py) | Hopper (SM90) | 685.08 |
-| TMA + tcgen05 UMMA | [`d1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/d1_tcgen05_tma_umma.py) | Blackwell (SM100) | 709.84 |
-| TMA + tcgen05 UMMA warp-specialized pipeline | `d2` | Blackwell (SM100) | TBD |
+| Stage | Script | Architecture | SM90 (H100) | SM100 (B200) | SM120 (B20) |
+|---|---|---|---|---|---|
+| Naïve GEMM | [`a1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute.py) | Any | 0.58 | similar | similar |
+| Shared memory GEMM | [`a2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a2_smem_cuda_like.py) | Any | 7.17 | similar | similar |
+| WMMA tensor cores + SMEM | [`b2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b2_wmma_smem.py) | Ampere+ (SM80+) | 203.29 | 241.30 | 295.26 |
+| WMMA + TMA load/store | [`b5`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b5_wmma_tma_load_store.py) | Hopper+ (SM90+) | 355.71 | 324.37 | 340.16 |
+| WMMA + TMA warp-specialized pipeline | [`b7`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b7_wmma_tma_pipeline.py) | Hopper+ (SM90+) | 392.86 | 424.70 | 345.27 |
+| WGMMA + TMA load/store | [`c1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c1_wgmma_tma_load_store.py) | Hopper (SM90) | 532.10 | - | - |
+| WGMMA + TMA warp-specialized pipeline | [`c2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c2_wgmma_tma_specialized_pipeline.py) | Hopper (SM90) | 685.08 | - | - |
+| TMA + tcgen05 UMMA | [`d1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/d1_tcgen05_tma_umma.py) | Blackwell (SM100) | - | 717.30 | - |
+| TMA + tcgen05 UMMA warp-specialized pipeline | `d2` | Blackwell (SM100) | - | TBD | - |
 
 We can improve further by using techniques such as Persistent kernel to overlap epilogue with the start of the next tile, TMA Multicast, TMEM staging in Blackwell,... to reach Speed of Light (CuBLAS) which is around 720 TFLOPS for H100 and 1500 TFLOPS for B200.
 

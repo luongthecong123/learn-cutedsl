@@ -7,6 +7,11 @@ import cutlass.utils.hopper_helpers as sm90_utils
 
 import torch
 
+"""
+Pipeline Async requires SM90+
+"""
+
+
 class GemmPipeAsync:
     def __init__(self):
         self.tile_shape_mnk = (8, 4, 16)
