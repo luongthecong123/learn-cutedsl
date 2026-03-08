@@ -9,6 +9,23 @@ import cutlass.utils.hopper_helpers as sm90_utils
 import cutlass.utils as utils
 from cutlass.cute.testing import benchmark, JitArguments
 
+"""
+Hopper WGMMA GEMM with TMA load and TMA store, single-stage.
+
+The simplest Hopper kernel using the two key SM90 hardware features:
+  1. TMA (Tensor Memory Accelerator) for async GMEM ↔ SMEM copies
+  2. WGMMA (Warp Group MMA) for async matrix multiply on tensor cores
+
+ALGORITHM (no warp specialization, no pipeline, no TMA/WGMMA overlap):
+  - TMA -> sync -> WGMMA -> sync -> Epilogue (RMEM -> (SMEM ->GMEM with TMA))
+
+SMEM budget (per CTA, single stage):
+  A: 128 x 128 x 2B = 32 KB
+  B: 128 x 128 x 2B = 32 KB
+  Total: 64 KB (1 stage)
+"""
+
+
 class Gemm_TC:
     def __init__(
         self,
@@ -17,6 +34,8 @@ class Gemm_TC:
         self.tile_shape_mnk = cta_tiler
         self.BM, self.BN, self.BK = self.tile_shape_mnk
         
+        # With (64, 128, 64), atom_layout = (1,1,1) => 1 MMA warp group
+        # With (128, 128, 64), atom_layout = (2,1,1) => 2 MMA warp groups        
         self.atom_layout_mnk = (
             (2, 1, 1)
             if self.BM > 64 and self.BN > 64
@@ -28,12 +47,8 @@ class Gemm_TC:
         
         self.mma_warp_groups = math.prod(self.atom_layout_mnk)
         self.threads_per_cta = self.mma_warp_groups * self.num_threads_per_warp_group
-        
-        assert self.BM % 64 == 0, "bM must be divisible by 64 for WGMMA"
-        assert self.BN % 64 == 0, "bN must be divisible by 64 for WGMMA"
 
         self.num_stages = 1
-        
         assert self.num_stages == 1, "This script only supports single stage for simplicity"
         
         self.buffer_align_bytes = 1024

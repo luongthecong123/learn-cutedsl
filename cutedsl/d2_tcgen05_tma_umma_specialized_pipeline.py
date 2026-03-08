@@ -13,50 +13,46 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.testing import benchmark, JitArguments
 
 """
-Blackwell tcgen05 GEMM with TMA load, single-stage, manual mbarriers.
+Blackwell tcgen05 GEMM with warp-specialized pipeline.
 
-The simplest Blackwell kernel using tcgen05 UMMA (Unified MMA).
-tcgen05 differs from Hopper's WGMMA in key ways:
-  - Accumulator lives in TMEM (Tensor Memory) instead of registers
-  - MMA is issued by a single thread like TMA
-  - Epilogue requires TMEM → RMEM before storing
+Builds on d1 (single-stage, single-warp TMA+MMA) by introducing:
+  1. Multi-stage software pipeline (PipelineTmaUmma) to overlap TMA loads with UMMA compute
+  2. Warp specialization: separate warps for TMA, MMA, and epilogue
+  3. Manual mbarrier for UMMA completion (tcgen05.commit → mbarrier_wait)
 
-ALGORITHM (no warp specialization, no pipeline, no TMA/UMMA overlap):
-  - TMA -> sync -> UMMA -> sync -> Epilogue (TMEM → RMEM → GMEM)
+WARP SPECIALIZATION (6 warps, 192 threads):
+  - Warp 5 (threads 160-191): TMA load producer
+  - Warp 4 (threads 128-159): MMA compute (tcgen05 UMMA, single-thread issue)
+  - Warps 0-3 (threads 0-127): Epilogue (TMEM → RMEM → GMEM)
 
-SMEM budget (per CTA, single stage):
-  A: 128 x 256 x 2B = 64 KB
-  B: 256 x 256 x 2B = 128 KB
-  Total: 192 KB (1 stage)
+ALGORITHM (warp specialization, pipeline smem staging, TMA/UMMA overlap):
+  - TMA/UMMA overlapping -> sync -> Epilogue (TMEM → RMEM → GMEM)
+
+SMEM budget (per CTA, 4 stages):
+  A: 128 x 64 x 2B = 16 KB/stage
+  B: 256 x 64 x 2B = 32 KB/stage
+  Total: 48 KB/stage x 4 = 192 KB
 """
-
-
-@dsl_user_op
-def tcgen05_fence(*, loc=None, ip=None) -> cutlass.Int32:
-    t = llvm.inline_asm(
-        T.i32(), [],
-        "tcgen05.fence::after_thread_sync;\n\tmov.u32 $0, 0;",
-        "=r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc, ip=ip,
-    )
-    return cutlass.Int32(t)
-
 
 class Gemm_TC:
     def __init__(
         self,
-        cta_tile_shape_mnk: Tuple[int, int, int] = (128, 256, 256), # or faster with (128, 512, 128)
+        cta_tile_shape_mnk: Tuple[int, int, int] = (128, 256, 64),
     ):
         self.cta_tile_shape_mnk = cta_tile_shape_mnk
         self.BM, self.BN, self.BK = cta_tile_shape_mnk
         self.mma_inst_shape_mnk = (self.BM, self.BN, 16)
 
-        self.threads_per_cta = 128
-        self.num_stages = 1
-        assert self.num_stages == 1, "This script only supports single stage for simplicity"
+        # Warp specialization
+        self.epi_warp_ids = (0, 1, 2, 3)
+        self.mma_warp_id = 4
+        self.tma_warp_id = 5
+        self.threads_per_warp = 32
+        self.threads_per_cta = self.threads_per_warp * len(
+            (*self.epi_warp_ids, self.mma_warp_id, self.tma_warp_id)
+        )
+
+        self.num_stages = 4
 
     @cute.jit
     def __call__(
@@ -82,6 +78,7 @@ class Gemm_TC:
         self.tiled_mma = cute.make_tiled_mma(op)
         print("tiled_mma: ", self.tiled_mma)
 
+        # Construct SMEM layouts with pipeline staging (num_stages instead of 1)
         self.a_smem_layout = sm100_utils.make_smem_layout_a(
             self.tiled_mma, self.cta_tile_shape_mnk, a.element_type, self.num_stages,
         )
@@ -91,9 +88,11 @@ class Gemm_TC:
         print("a_smem_layout: ", self.a_smem_layout)
         print("b_smem_layout: ", self.b_smem_layout)
 
+        # Single-stage view for TMA atom creation
         a_smem_layout_one_stage = cute.select(self.a_smem_layout, mode=[0, 1, 2])
         b_smem_layout_one_stage = cute.select(self.b_smem_layout, mode=[0, 1, 2])
 
+        # Construct TMA load atoms (MMA-aware partitioning)
         op_g2s = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
         tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
             op_g2s, a, a_smem_layout_one_stage, self.cta_tile_shape_mnk, self.tiled_mma,
@@ -102,15 +101,14 @@ class Gemm_TC:
             op_g2s, b, b_smem_layout_one_stage, self.cta_tile_shape_mnk, self.tiled_mma,
         )
 
-
+        # c layout enum for get_tmem_load_op
         self.c_layout = utils.LayoutEnum.from_tensor(c)
 
-        # Shared storage: barriers + TMEM allocation tracking
-        # (SMEM tensors for A/B are allocated separately via SmemAllocator)
+        # Shared storage: pipeline barriers + TMEM allocation tracking
         @cute.struct
         class SharedStorage:
-            tma_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
-            mma_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
+            mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
+            mma_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]  # manual mbarrier for UMMA completion
             tmem_holding_buf: cutlass.Int32
 
         self.shared_storage = SharedStorage
@@ -150,8 +148,7 @@ class Gemm_TC:
         bidx, bidy, _ = cute.arch.block_idx()
         mma_coord_mnk = (bidx, bidy, None)
 
-        # Prefetch TMA descriptors
-        if warp_idx == 0:
+        if warp_idx == self.tma_warp_id:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
 
@@ -171,7 +168,7 @@ class Gemm_TC:
             swizzle=b_smem_layout.inner,
         )
 
-        # ====== TMEM ======
+        # ====== TMEM allocation ======
         tmem_barrier_id = 1
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=tmem_barrier_id,
@@ -183,16 +180,20 @@ class Gemm_TC:
         )
 
         # ====== Partition tensors for MMA ======
+        # (bM, bK, num_k_tiles)
         gA = cute.local_tile(mA_tma_tensor, self.cta_tile_shape_mnk, mma_coord_mnk, proj=(1, None, 1))
+        # (bN, bK, num_k_tiles)
         gB = cute.local_tile(mB_tma_tensor, self.cta_tile_shape_mnk, mma_coord_mnk, proj=(None, 1, 1))
+        # (bM, bN)
         gC = cute.local_tile(mC, self.cta_tile_shape_mnk, mma_coord_mnk, proj=(1, 1, None))
 
-        # tcgen05: single-thread partitioning
+        # tcgen05: single-thread partitioning (not warp-group based like WGMMA)
         thr_mma = tiled_mma.get_slice(thr_idx=0)
         tCgA = thr_mma.partition_A(gA)
         tCgB = thr_mma.partition_B(gB)
         tCgC = thr_mma.partition_C(gC)
 
+        # Fragments: A/B read directly from SMEM (now multi-stage)
         tCrA = tiled_mma.make_fragment_A(sA)
         tCrB = tiled_mma.make_fragment_B(sB)
 
@@ -205,6 +206,8 @@ class Gemm_TC:
         tmem.allocate(num_tmem_cols)
 
         # ====== TMA partition (through MMA partitioning) ======
+        # group_modes(sA, 0, 3) groups spatial dims, leaving the stage dim
+        # Result: tAsA is (TMA_part, stages), tAgA is (TMA_part, num_k_tiles)
         tAsA, tAgA = cpasync.tma_partition(
             tma_atom_a, 0, cute.make_layout(1),
             cute.group_modes(sA, 0, 3),
@@ -217,14 +220,13 @@ class Gemm_TC:
         )
 
         # ====== Setup TMEM pointer ======
+        # CTA-wide sync before retrieving TMEM start address
+        # (only warp 0 does allocation, so all warps sync here)
         tmem.wait_for_alloc()
         tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
-        # Swap the pointer in tCtAcc
         tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc.layout)
 
         # ====== Epilogue setup: TMEM → RMEM → GMEM ======
-        # Delegate copy atom selection to sm100_utils — picks Ld32x32bOp repetition
-        # based on tile shape, c_layout, dtypes; subtile_cnt derived from partition shape
         epi_tile = self.cta_tile_shape_mnk[:2]
         print("epi_tile: ", epi_tile)
         copy_atom_t2r = sm100_utils.get_tmem_load_op(
@@ -235,24 +237,29 @@ class Gemm_TC:
             epi_tile,
             use_2cta_instrs=False,
         )
-
+        # (EPI_TILE_M, EPI_TILE_N)
         tAcc_epi = cute.flat_divide(tCtAcc[((None, None), 0, 0)], epi_tile)
         tmem_tiled_copy = tcgen05.make_tmem_copy(copy_atom_t2r, tAcc_epi[(None, None, 0, 0)])
         tmem_thr_copy = tmem_tiled_copy.get_slice(tidx)
 
-
+        # (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
         tTR_tAcc = tmem_thr_copy.partition_S(tAcc_epi)
         tCgC_epi = cute.flat_divide(tCgC[((None, None), 0, 0)], epi_tile)
+        # (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
         tTR_gC = tmem_thr_copy.partition_D(tCgC_epi)
+        # (T2R, T2R_M, T2R_N)
         tTR_rAcc = cute.make_rmem_tensor(tTR_gC[(None, None, None, 0, 0)].shape, self.acc_dtype)
         tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
+
+        # Group trailing dims; subtile_cnt falls out of partition shape (mode 3)
         tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
         tTR_gC = cute.group_modes(tTR_gC, 3, cute.rank(tTR_gC))
+
         simt_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.c_dtype)
 
-        # ====== Barrier setup ======
-        tma_mbar = storage.tma_mbar_ptr.data_ptr()
-        mma_mbar = storage.mma_mbar_ptr.data_ptr()
+        # ====== Pipeline setup ======
+        # Trivial CTA layout for 1CTA (no cluster, no 2CTA)
+        cta_layout_vmnk = cute.make_layout((1, 1, 1, 1))
 
         tma_transaction_bytes = cute.size_in_bytes(
             self.a_dtype, cute.select(a_smem_layout, mode=[0, 1, 2])
@@ -260,58 +267,58 @@ class Gemm_TC:
             self.b_dtype, cute.select(b_smem_layout, mode=[0, 1, 2])
         )
 
-        # ====== Main loop (only warp 0 does TMA + MMA) ======
-        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)# acc = 0
+        # AB pipeline: TMA producer (warp 5) → UMMA consumer (warp 4)
+        # PipelineTmaUmma synchronizes TMA loads with tcgen05 MMA consumption
+        # - producer_group: single thread (TMA is issued by 1 thread)
+        # - consumer_group: 1 thread (UMMA is single-thread on tcgen05)
+        producer, consumer = pipeline.PipelineTmaUmma.create(
+            num_stages=self.num_stages,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+            tx_count=tma_transaction_bytes,
+            barrier_storage=storage.mbar_ptr.data_ptr(),
+            cta_layout_vmnk=cta_layout_vmnk,
+        ).make_participants()
 
+        # Manual mbarrier for UMMA async completion (replaces PipelineUmmaAsync)
+        # tcgen05.commit(mma_mbar) signals when all preceding TMEM writes finish.
+        mma_mbar = storage.mma_mbar_ptr.data_ptr()
         if warp_idx == 0 and tidx == 0:
-            # Set expected arrival count for mbarrier, TMA is issued by only 1 thread, so the count is 1, same for UMMA
-            cute.arch.mbarrier_init(tma_mbar, cnt=1)
             cute.arch.mbarrier_init(mma_mbar, cnt=1)
             cute.arch.mbarrier_init_fence()
-        # Make sure the mbarrier initialization is visible to all threads
         cute.arch.sync_threads()
 
-        # Signal that the phase/TMA/mma is complete
-        tma_phase = 0
-        mma_phase = 0
+        # ====== Main loop ======
+        num_k_tiles = mA_tma_tensor.shape[1] // self.BK
 
-        for kidx in range(mA_tma_tensor.shape[1] // self.BK):
-            # cute launches tma and umma using a single thread under the hood, so here if we use only one thread to call the op, it will cause a deadlock. Hence we call it using the first warp instead.
-            if warp_idx == 0:
+        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)  # acc = 0
+
+        # ------ TMA Load Producer ------
+        if warp_idx == self.tma_warp_id:
+            for kidx in cutlass.range(num_k_tiles):
+                ab_empty = producer.acquire_and_advance()
+
                 cute.copy(
                     tma_atom_a,
-                    tAgA[None, kidx],
-                    tAsA[None, 0],
-                    tma_bar_ptr=tma_mbar
+                    tAgA[None, ab_empty.count],
+                    tAsA[None, ab_empty.index],
+                    tma_bar_ptr=ab_empty.barrier,
                 )
-
                 cute.copy(
                     tma_atom_b,
-                    tBgB[None, kidx],
-                    tBsB[None, 0],
-                    tma_bar_ptr=tma_mbar
+                    tBgB[None, ab_empty.count],
+                    tBsB[None, ab_empty.index],
+                    tma_bar_ptr=ab_empty.barrier,
                 )
 
-                if tidx == 0:
-                    # Track how bytes have been transferred with mbarrier
-                    # When both arrival count above and expected bytes reach zero, the barrier is released and move on to the next phase
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        tma_mbar,
-                        tma_transaction_bytes,
-                    )
+        # ------ MMA Compute (UMMA Consumer) ------
+        if warp_idx == self.mma_warp_id:
+            for kidx in cutlass.range(num_k_tiles):
+                ab_full = consumer.wait_and_advance()
 
-            cute.arch.mbarrier_wait(tma_mbar, tma_phase)
-
-            # Flip the phase using XOR
-            tma_phase ^= 1
-
-            _ = tcgen05_fence()
-
-            num_k_blocks = cute.size(tCrA, mode=[2])
-
-            if warp_idx == 0:
-                for k_block_idx in range(num_k_blocks):
-                    k_block_coord = (None, None, k_block_idx, 0)
+                num_k_blocks = cute.size(tCrA, mode=[2])
+                for k_block_idx in cutlass.range_constexpr(num_k_blocks):
+                    k_block_coord = (None, None, k_block_idx, ab_full.index)
                     cute.gemm(
                         tiled_mma,
                         tCtAcc,
@@ -321,25 +328,34 @@ class Gemm_TC:
                     )
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
-                if tidx == 0:
-                    tcgen05.commit(mma_mbar)
+                ab_full.release()
 
-            cute.arch.mbarrier_wait(mma_mbar, mma_phase)
-            mma_phase ^= 1
+            # Signal UMMA completion: hardware arrives at mma_mbar
+            # when all preceding TMEM writes finish
+            if tidx == self.mma_warp_id * self.threads_per_warp:
+                tcgen05.commit(mma_mbar)
 
         # ====== Epilogue: TMEM → RMEM → GMEM ======
 
         # Release TMEM allocation lock
         tmem.relinquish_alloc_permit()
 
-        # subtile_cnt derived from partition shape (mode 3)
-        subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
-        for subtile_idx in cutlass.range(subtile_cnt):
-            cute.copy(tmem_tiled_copy, tTR_tAcc[(None, None, None, subtile_idx)], tTR_rAcc)
-            tTR_rC.store(tTR_rAcc.load().to(self.c_dtype))
-            cute.copy(simt_atom, tTR_rC, tTR_gC[(None, None, None, subtile_idx)])
+        # All threads wait for UMMA to finish writing TMEM
+        cute.arch.mbarrier_wait(mma_mbar, 0)
 
-        # Deallocate TMEM
+        if warp_idx <= self.epi_warp_ids[-1]:
+            subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+            for subtile_idx in cutlass.range(subtile_cnt):
+                cute.copy(tmem_tiled_copy, tTR_tAcc[(None, None, None, subtile_idx)], tTR_rAcc)
+                tTR_rC.store(tTR_rAcc.load().to(self.c_dtype))
+                cute.copy(simt_atom, tTR_rC, tTR_gC[(None, None, None, subtile_idx)])
+
+        # Producer tail
+        if warp_idx == self.tma_warp_id:
+            producer.tail()
+
+        # Sync all threads before TMEM deallocation
+        pipeline.sync(barrier_id=tmem_barrier_id)
         tmem.free(tmem_ptr)
 
 

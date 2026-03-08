@@ -19,15 +19,15 @@ class Gemm_TC:
         self.BM, self.BN, self.BK = self.tile_shape_mnk
         self.mma_inst_shape = (16, 8, 16)
         self.atom_layout_mnk = (4, 2, 1)
-        self.warp_size = cute.arch.WARP_SIZE
+        self.threads_per_warp = cute.arch.WARP_SIZE
 
-        # 16 MMA warps (warps 0-15) + 1 TMA warp (warp 16)
+        # Warp specialization: 8 MMA warps + 1 TMA warp
         self.num_mma_warps = self.atom_layout_mnk[0] * self.atom_layout_mnk[1]
-        self.num_tma_warps = 1
-        self.threads_per_cta = self.warp_size * (self.num_mma_warps + self.num_tma_warps)
-
-        assert self.BM % 16 == 0, "bM must be divisible by 16"
-        assert self.BN % 16 == 0, "bN must be divisible by 16"
+        self.mma_warp_ids = tuple(range(self.num_mma_warps))
+        self.tma_warp_id = self.num_mma_warps
+        self.threads_per_cta = self.threads_per_warp * len(
+            (*self.mma_warp_ids, self.tma_warp_id)
+        )
 
         cc = torch.cuda.get_device_capability()
         if cc >= (9, 0) and cc < (12, 0):
@@ -148,11 +148,9 @@ class Gemm_TC:
         bidx, bidy, _ = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
 
-        # Threads 0-511: MMA warps (warps 0-15)
-        # Threads 512-543: TMA warp (warp 16)
-        num_mma_threads = self.num_mma_warps * self.warp_size
-        is_mma_warp = tidx < num_mma_threads
-        is_tma_warp = warp_idx == self.num_mma_warps
+        # Threads 0-255: MMA warps, Threads 256-287: TMA warp
+        is_mma_warp = warp_idx <= self.mma_warp_ids[-1]
+        is_tma_warp = warp_idx == self.tma_warp_id
 
         if is_tma_warp:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
@@ -256,7 +254,7 @@ class Gemm_TC:
 
         mainloop_pipeline = PipelineTmaAsync.create(
             num_stages=self.num_stages,
-            producer_group=CooperativeGroup(Agent.Thread, self.num_tma_warps),
+            producer_group=CooperativeGroup(Agent.Thread, 1),
             consumer_group=CooperativeGroup(Agent.Thread, self.num_mma_warps),
             barrier_storage=mbar_ptr,
             tx_count=tma_transaction_bytes,

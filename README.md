@@ -45,19 +45,20 @@ Suggested progression:
 
 **FLOPS progression** (M=N=K=4096, dtype=float16):
 
-| Stage | Script | Architecture | SM90 (H100) | SM100 (B200) | SM120 (B20) |
+| Stage | Script | Architecture | SM90 (H100) | SM100 (B200) | SM120 (RTX Pro 6K) |
 |---|---|---|---|---|---|
-| Naïve GEMM | [`a1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute.py) | Any | 0.58 | similar | similar |
-| Shared memory GEMM | [`a2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a2_smem_cuda_like.py) | Any | 7.17 | similar | similar |
-| WMMA tensor cores + SMEM | [`b2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b2_wmma_smem.py) | Ampere+ (SM80+) | 203.29 | 241.30 | 295.26 |
-| WMMA + TMA load/store | [`b5`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b5_wmma_tma_load_store.py) | Hopper+ (SM90+) | 355.71 | 324.37 | 340.16 |
+| Naïve | [`a1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute.py) | Any | 0.58 | similar | similar |
+| Shared memory | [`a2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a2_smem_cuda_like.py) | Any | 7.17 | similar | similar |
+| WMMA | [`b2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b2_wmma_smem.py) | Ampere+ (SM80+) | 203.29 | 241.30 | 295.26 |
+| WMMA + TMA | [`b5`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b5_wmma_tma_load_store.py) | Hopper+ (SM90+) | 355.71 | 324.37 | 340.16 |
 | WMMA + TMA warp-specialized pipeline | [`b7`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b7_wmma_tma_pipeline.py) | Hopper+ (SM90+) | 392.86 | 424.70 | 345.27 |
-| WGMMA + TMA load/store | [`c1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c1_wgmma_tma_load_store.py) | Hopper (SM90) | 532.10 | - | - |
+| WGMMA + TMA | [`c1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c1_wgmma_tma_load_store.py) | Hopper (SM90) | 532.10 | - | - |
 | WGMMA + TMA warp-specialized pipeline | [`c2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c2_wgmma_tma_specialized_pipeline.py) | Hopper (SM90) | 685.08 | - | - |
-| TMA + tcgen05 UMMA | [`d1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/d1_tcgen05_tma_umma.py) | Blackwell (SM100) | - | 717.30 | - |
-| TMA + tcgen05 UMMA warp-specialized pipeline | `d2` | Blackwell (SM100) | - | TBD | - |
+| tcgen05 MMA + TMA | [`d1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/d1_tcgen05_tma_umma.py) | Blackwell (SM100) | - | 717.30 | - |
+| tcgen05 MMA + TMA warp-specialized pipeline | [`d2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/d2_tcgen05_tma_umma_specialized_pipeline.py) | Blackwell (SM100) | - | 1279.36 | - |
+| tcgen05 MMA 2CTA + TMA warp-specialized pipeline | [`d3`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/d3_tcgen05_tma_umma_2cta_specialized_pipeline.py) | Blackwell (SM100) | - | 1366.63 | - |
 
-We can improve further by using techniques such as Persistent kernel to overlap epilogue with the start of the next tile, TMA Multicast, TMEM staging in Blackwell,... to reach Speed of Light (CuBLAS) which is around 720 TFLOPS for H100 and 1500 TFLOPS for B200.
+We can improve further by using techniques such as Persistent kernel to overlap epilogue with the start of the next tile, TMA Multi-cast, TMEM staging in Blackwell,... to reach Speed of Light (CuBLAS) which is around 720 TFLOPS for H100 and 1500 TFLOPS for B200.
 
 </details>
 
@@ -144,7 +145,7 @@ CuTeDSL handles the bridge via MLIR/NVVM — no `pybind11` bindings, no `.cu`/`.
 
 ### 2.3. Threads and Blocks — the CUDA Execution Model
 
-When you call `.launch(grid=[Gx, Gy, 1], block=[Bx, By, 1])`, the GPU spawns `Gx × Gy` blocks (also called CTAs — Cooperative Thread Arrays), each containing `Bx × By` threads. Every thread runs the same kernel function but gets a different `(block_idx, thread_idx)` combination, so each one can compute its own unique slice of the output. The key identities are:
+When you call `.launch(grid=[Gx, Gy, 1], block=[Bx, By, 1])`, the GPU spawns `Gx x Gy` blocks (also called CTAs — Cooperative Thread Arrays), each containing `Bx x By` threads. Every thread runs the same kernel function but gets a different `(block_idx, thread_idx)` combination, so each one can compute its own unique slice of the output. The key identities are:
 
 ```
 global_row = block_idx.y * block_dim.y + thread_idx.y
@@ -260,7 +261,7 @@ layout_sA_swizzled = cute.make_composed_layout(
 
 ### 2.5. Shared Memory
 
-Shared memory (SMEM) is an on-chip scratchpad shared by all threads in a block — roughly 100× lower latency than global memory. In CuTeDSL, SMEM is allocated with:
+Shared memory (SMEM) is an on-chip scratchpad shared by all threads in a block — roughly 100x lower latency than global memory. In CuTeDSL, SMEM is allocated with:
 
 ```python
 # cutlass.utils.SmemAllocator — manages a contiguous SMEM buffer
@@ -321,7 +322,7 @@ An **MMA Atom** wraps a single hardware matrix-multiply-accumulate instruction. 
 mma_op = cute.nvgpu.warp.MmaF16BF16Op(
     ab_dtype=cutlass.Float16, acc_dtype=cutlass.Float32, shape_mnk=(16, 8, 16))
 
-# Tile it: atom_layout_mnk=(4,4,1) means 4×4 warp-level tiles → 512 threads
+# Tile it: atom_layout_mnk=(4,4,1) means 4x4 warp-level tiles → 512 threads
 tiled_mma = cute.make_tiled_mma(
     op_or_atom=mma_op,
     atom_layout_mnk=(4, 4, 1),
@@ -357,7 +358,7 @@ cute.gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC)   # issue MMA
 
 In CUDA optimization, one strategy is to fuse multiple operations — for example, performing GEMM and immediately applying an element-wise transformation on the accumulator — without ever materializing the large output tensor to global memory. This requires knowing exactly which thread holds which output element.
 
-For example, in my custom RNN kernel that achieved 90–110× speedup over PyTorch [Repo link](https://github.com/chongxi/rnn_train_ring_attractor/blob/main/cpp/kernels/fwd_1loop_tc_idx.cuh#L172), the key insight was to avoid materializing the large matC, and performing a GEMV (matrix-vector multiplication) directly on the fragC on register file. This requires mapping each thread's accumulator registers to logical `(m, n)` coordinates.
+For example, in my custom RNN kernel that achieved 90–110x speedup over PyTorch [Repo link](https://github.com/chongxi/rnn_train_ring_attractor/blob/main/cpp/kernels/fwd_1loop_tc_idx.cuh#L172), the key insight was to avoid materializing the large matC, and performing a GEMV (matrix-vector multiplication) directly on the fragC on register file. This requires mapping each thread's accumulator registers to logical `(m, n)` coordinates.
 
 By reading the PTX documentation one can derive this mapping manually with modulo and integer division [CUDA C++ Example](https://github.com/chongxi/rnn_train_ring_attractor/blob/main/cpp/kernels/fwd_1loop_tc_idx.cuh#L6). 
 
@@ -411,7 +412,7 @@ TV Layout C:     ((4,8),(2,2)):((32,1),(16,8))
 - `(4,8)` → 32 threads (one warp)
 - `(2,2)` → 4 registers per thread for the accumulator fragment
 
-After tiling this atom 4×4 (512 threads total), the tiled TV layout becomes:
+After tiling this atom 4x4 (512 threads total), the tiled TV layout becomes:
 
 ```
 tv_layout_C_tiled:
@@ -575,13 +576,13 @@ A_ = from_dlpack(A, assumed_align=16)
 - **Warpgroup-wide**: requires all **128 threads** in a warpgroup (4 contiguous warps whose first warp rank is a multiple of 4) to issue the instruction collectively.
 - **Asynchronous**: `cute.gemm(tiled_mma, ...)` returns immediately; the tensor cores continue computing in the background, reading operands directly from **SMEM via matrix descriptors** (not registers), and writing to register-backed accumulators.
 - **B operand always comes from SMEM**. A can come from SMEM (`SS` mode) or registers (`RS` mode). In `c1`, both A and B are sourced from SMEM (SS mode).
-- **Higher throughput** than `wmma` — responsible for the 2.3× jump from `b5` to `c1` in the FLOPS table.
+- **Higher throughput** than `wmma` — responsible for the 2.3x jump from `b5` to `c1` in the FLOPS table.
 
 #### 4.2.1. WGMMA Atom Shape Constraints
 
 The underlying PTX instruction is `wgmma.mma_async.sync.aligned.M64xNxK`. The tile shape is constrained:
 - **M is always 64** — one WGMMA atom always covers 64 rows.
-- **K × sizeof(dtype) = 32 bytes** — so for `float16`, K = 16; for `float8`, K = 32.
+- **K x sizeof(dtype) = 32 bytes** — so for `float16`, K = 16; for `float8`, K = 32.
 - **N is a multiple of 8, from 8 to 256**.
 
 This imposes the assertions in `c1`:
@@ -603,15 +604,15 @@ self.tiled_mma = sm90_utils.make_trivial_tiled_mma(
     self.b_layout.sm90_mma_major_mode(),
     self.acc_dtype,                         # Float32 accumulator
     self.atom_layout_mnk,                   # e.g. (1,1,1) = one warpgroup
-    tiler_mn=(64, self.tile_shape_mnk[1]), # the M×N output tile per warpgroup
+    tiler_mn=(64, self.tile_shape_mnk[1]), # the MxN output tile per warpgroup
 )
 ```
 *[`c1_wgmma_tma_load_store.py` L125–L133](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c1_wgmma_tma_load_store.py#L125).*
 
-`atom_layout_mnk` tiles the single 64×N atom across multiple warpgroups. For `BM=64`, it is `(1,1,1)` (one warpgroup). For `BM=128`, setting it to `(2,1,1)` assigns 2 warpgroups to split the M-dimension, each computing a 64×N subtile independently. The total thread count becomes:
+`atom_layout_mnk` tiles the single 64xN atom across multiple warpgroups. For `BM=64`, it is `(1,1,1)` (one warpgroup). For `BM=128`, setting it to `(2,1,1)` assigns 2 warpgroups to split the M-dimension, each computing a 64xN subtile independently. The total thread count becomes:
 
 ```python
-self.threads_per_cta = math.prod(self.atom_layout_mnk) * 128  # warpgroups × 128 threads
+self.threads_per_cta = math.prod(self.atom_layout_mnk) * 128  # warpgroups x 128 threads
 ```
 
 For `float16`, both MN-major and K-major are supported. For other dtypes, only K-major is allowed (no transpose support in PTX for non-16-bit).
@@ -636,7 +637,7 @@ tCrB = tiled_mma.make_fragment_B(tCsB)
 
 `tCrA` and `tCrB` are not register tensors — they are `GMMA::DescriptorIterator` objects. Internally each is a 64-bit matrix descriptor held in registers that points into SMEM. The descriptor encodes the SMEM base address, leading byte offset (LBO), stride byte offset (SBO), and swizzle mode. `wgmma.mma_async` reads the descriptor from registers but fetches the actual matrix data directly from SMEM via the L2 cache, bypassing registers entirely. Only the current descriptor (not all of them) is held in registers at any given time — hence "Iterator".
 
-In contrast, `tCrC` (the accumulator) is a register-backed tensor — the 32 output values per thread for a 64×64 output atom are stored in registers.
+In contrast, `tCrC` (the accumulator) is a register-backed tensor — the 32 output values per thread for a 64x64 output atom are stored in registers.
 
 #### 4.2.4. SMEM Layout Constraints
 
@@ -911,7 +912,7 @@ The figure below shows producer (SMEM load) and consumer (MMA) timelines per war
 
 ![PipelineAsync profile](./assets/a2_pipeline_profile.png)
 
-**Profile of PipelineTmaAsync (c3, 64×128×64 tile):**
+**Profile of PipelineTmaAsync (c3, 64x128x64 tile):**
 
 Running `c3_wgmma_tma_specialized_pipeline_profile.py` and visualizing on Perfetto shows the first 3 prefetched TMA loads (filling the pipeline), followed by well-overlapped WGMMA compute and TMA loads in the steady state. Launch overhead is still visible at the start.
 

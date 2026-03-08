@@ -10,6 +10,27 @@ import cutlass.utils as utils
 from cutlass.cute.testing import benchmark, JitArguments
 from cutlass.pipeline import PipelineTmaAsync, CooperativeGroup, Agent, make_pipeline_state, PipelineUserType
 
+"""
+Hopper WGMMA GEMM with TMA warp-specialized pipeline.
+
+Builds on c1 (single-stage TMA + WGMMA) by introducing:
+  1. Multi-stage software pipeline (PipelineTmaAsync) to overlap TMA loads with WGMMA compute
+  2. Warp specialization: TMA warp produces SMEM tiles, MMA warps consume them
+
+WARP SPECIALIZATION:
+  - Warp 4 (threads 128-159): TMA load producer
+  - Warps 0-3 (threads 0-127): WGMMA compute + epilogue (RMEM → GMEM via CopyUniversalOp)
+
+ALGORITHM:
+  - TMA/WGMMA overlapping -> WGMMA warps store RMEM -> GMEM
+
+SMEM budget (per CTA, 4 stages):
+  A: 128 x 64 x 2B = 16 KB/stage
+  B: 256 x 64 x 2B = 32 KB/stage
+  Total: 48 KB/stage x 4 = 192 KB
+"""
+
+
 class Gemm_TC:
     def __init__(
         self,
@@ -26,15 +47,17 @@ class Gemm_TC:
             else (1, 1, 1)
         )
 
-        self.warp_size = cute.arch.WARP_SIZE
-        self.num_threads_per_warp_group = 128
+        self.threads_per_warp = 32
+        self.threads_per_warp_group = 128  # 4 warps per warp group
 
+        # Warp specialization: N MMA warp groups + 1 TMA warp
         self.num_mma_warp_groups = math.prod(self.atom_layout_mnk)
-        self.num_tma_warps = 1
-        self.threads_per_cta = self.num_mma_warp_groups * self.num_threads_per_warp_group + self.warp_size * self.num_tma_warps
-
-        assert self.BM % 64 == 0, "bM must be divisible by 64 for WGMMA"
-        assert self.BN % 64 == 0, "bN must be divisible by 64 for WGMMA"
+        self.num_mma_warps = self.num_mma_warp_groups * 4
+        self.mma_warp_ids = tuple(range(self.num_mma_warps))
+        self.tma_warp_id = self.num_mma_warps
+        self.threads_per_cta = self.threads_per_warp * len(
+            (*self.mma_warp_ids, self.tma_warp_id)
+        )
 
         self.num_stages = 4
         self.buffer_align_bytes = 1024
@@ -147,10 +170,8 @@ class Gemm_TC:
         bidx, bidy, _ = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
 
-        # Threads 0-127: MMA warps (warps 0-3)
-        # Threads 128-159: TMA warp (warp 4)
-        is_mma_warp = tidx < self.num_mma_warp_groups * self.num_threads_per_warp_group
-        is_tma_warp = warp_idx // 4 == self.num_mma_warp_groups
+        is_mma_warp = warp_idx <= self.mma_warp_ids[-1]
+        is_tma_warp = warp_idx == self.tma_warp_id
 
         if is_tma_warp:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
@@ -209,10 +230,10 @@ class Gemm_TC:
 
         # ===== mma thread partitioning memory spaces =====
         warp_group_idx = cute.arch.make_warp_uniform(
-            tidx // self.num_threads_per_warp_group
+            tidx // self.threads_per_warp_group
         )
         warp_group_thread_layout = cute.make_layout(
-            self.num_mma_warp_groups, stride=self.num_threads_per_warp_group
+            self.num_mma_warp_groups, stride=self.threads_per_warp_group
         )
         thr_mma = tiled_mma.get_slice(warp_group_thread_layout(warp_group_idx))
 
@@ -234,11 +255,10 @@ class Gemm_TC:
         mbar_ptr = storage.mainloop_pipeline_array_ptr.data_ptr()
 
         # Pipeline: TMA warp is producer, MMA warps are consumers
-        num_consumer_warps = self.num_mma_warp_groups * (self.num_threads_per_warp_group // self.warp_size)
         mainloop_pipeline = PipelineTmaAsync.create(
             num_stages=self.num_stages,
-            producer_group=CooperativeGroup(Agent.Thread, self.num_tma_warps),
-            consumer_group=CooperativeGroup(Agent.Thread, num_consumer_warps),
+            producer_group=CooperativeGroup(Agent.Thread, 1),
+            consumer_group=CooperativeGroup(Agent.Thread, self.num_mma_warps),
             barrier_storage=mbar_ptr,
             tx_count=tma_transaction_bytes,
             cta_layout_vmnk=cute.make_layout((1, 1, 1, 1))

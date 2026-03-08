@@ -17,9 +17,7 @@ class Gemm_TC:
         self.mma_inst_shape = (16, 8, 16)
         self.atom_layout_mnk = (4, 4, 1)
         self._smem_padding = 8
-        self._num_vectorized = 4
-        assert self._bM % 16 == 0, "bM must be divisible by 16"
-        assert self._bN % 16 == 0, "bN must be divisible by 16"        
+        self._num_vectorized = 4       
     
     @cute.jit
     def __call__(
