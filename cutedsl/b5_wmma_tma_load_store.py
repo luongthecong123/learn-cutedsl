@@ -9,6 +9,22 @@ from typing import Tuple
 
 import torch
 
+"""
+Blackwell SM120 (RTX 5090 or RTX Pro 6000 Blackwell)
+WMMA GEMM with TMA load, single-stage, manual mbarriers.
+
+ALGORITHM:
+  - TMA -> sync -> WMMA -> sync -> repeat
+    
+SMEM budget (per CTA, 2 stages):
+  A: 128 x 64 x 2B = 16 KB/stage
+  B: 128 x 64 x 2B = 16 KB/stage
+  Total: 32 KB per block
+  
+SM120 can allocate up to 99 KB per Block
+-> Can launch 3 block per SM on SM120 (Occupancy 32*4 * 3 / 1536 = 25%), 
+but used larger SMEM which benefits TMA performance and better data reuse
+"""
 
 class Gemm_TC:
     def __init__(

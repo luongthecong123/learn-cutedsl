@@ -6,6 +6,23 @@ from typing import Tuple
 
 import torch
 
+"""
+Ampere SM80, SM86 (RTX3090, A100)
+WMMA GEMM with vecorized GMEM -> SMEM with tv layout
+
+ALGORITHM:
+  - vanilla copy -> sync -> WMMA -> sync -> repeat
+    
+SMEM budget (per CTA, 2 stages):
+  A: 128 x 64 x 2B = 16 KB/stage
+  B: 128 x 64 x 2B = 16 KB/stage
+  Total: 32 KB per block
+  
+SM80/SM86 can allocate up to 99 KB per Block
+-> Can launch 3 block per SM on SM80/SM86 (Occupancy 32*4 * 3 / 1536 = 25%), 
+but used larger SMEM for better data reuse
+"""
+
 class Gemm_TC:
     def __init__(
         self,
@@ -31,22 +48,21 @@ class Gemm_TC:
         mma_op = cute.nvgpu.warp.MmaF16BF16Op(
             ab_dtype=cutlass.Float16, acc_dtype=cutlass.Float32, shape_mnk=self.mma_inst_shape)
         
-        print(f"[DEBUG GEMM TC] mma_op: {mma_op}")
+        print(f"mma_op: {mma_op}")
 
         permutation_mnk = (
-            self.atom_layout_mnk[0] * self.mma_inst_shape[0], # 4 * 16 = 64
-            # if atom layout's N-mode is 1, to leverage the largest coalesced
-            # shared memory -> register copy, set the tiled mma's N mode to 16
-            self.atom_layout_mnk[1] * self.mma_inst_shape[1] * 2, # 4 * 8 * 2 = 64
+            self.atom_layout_mnk[0] * self.mma_inst_shape[0],
+            self.atom_layout_mnk[1] * self.mma_inst_shape[1] * 2,
             self.atom_layout_mnk[2] * self.mma_inst_shape[2],
         )     
+        print(f"permutation_mnk: {permutation_mnk}")
         
         tiled_mma = cute.make_tiled_mma(
             op_or_atom=mma_op,
             atom_layout_mnk=self.atom_layout_mnk,
             permutation_mnk=permutation_mnk)
 
-        print(f"[DEBUG GEMM TC] tiled_mma: {tiled_mma}")
+        print(f"tiled_mma: {tiled_mma}")
         
         # ====== SMEM layout ======
         padding = self._smem_padding
@@ -143,6 +159,7 @@ class Gemm_TC:
         tCsB = thr_mma.partition_B(sB)
         
         tCgC = thr_mma.partition_C(gC)
+        print("tCgC: ", tCgC)
         tCrA = tiled_mma.make_fragment_A(tCsA)
         tCrB = tiled_mma.make_fragment_B(tCsB)
         tCrC = tiled_mma.make_fragment_C(tCgC)

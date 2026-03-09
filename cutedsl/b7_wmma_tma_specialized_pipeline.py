@@ -8,7 +8,30 @@ from cutlass.pipeline import PipelineTmaAsync, CooperativeGroup, Agent, make_pip
 from typing import Tuple
 
 import torch
+"""
+Blackwell SM120 (RTX 5090 or RTX Pro 6000 Blackwell)
+WMMA GEMM with TMA load, multi stages pipeline, and warp specialization
 
+Builds on b5 (single-stage TMA + WMMA) by introducing:
+  1. Multi-stage software pipeline (PipelineTmaAsync) to overlap TMA loads with WMMA compute
+  2. Warp specialization: TMA warp produces SMEM tiles, WMMA warps consume them
+
+WARP SPECIALIZATION:
+  - Warp 8 (threads 128-159): TMA load producer
+  - Warps 0-7 (threads 0-127): WMMA compute + epilogue (RMEM → GMEM via CopyUniversalOp)
+
+ALGORITHM:
+  - TMA/WMMA overlapping -> WMMA warps store RMEM -> GMEM
+    
+SMEM budget (per CTA, 2 stages):
+  A: 128 x 64 x 2B = 16 KB/stage
+  B: 128 x 64 x 2B = 16 KB/stage
+  Total: 32 KB/stage x 2 = 64 KB
+  
+SM120 can allocate up to 99 KB per Block
+-> Can only launch 1 block per SM on SM120 (Occupancy 32*9 / 1536 = 18.75%), 
+but used larger SMEM which benefits TMA performance and better data reuse
+"""
 
 class Gemm_TC:
     def __init__(
@@ -21,7 +44,7 @@ class Gemm_TC:
         self.atom_layout_mnk = (4, 2, 1)
         self.threads_per_warp = cute.arch.WARP_SIZE
 
-        # Warp specialization: 8 MMA warps + 1 TMA warp
+        # Warp specialization: 8 WMMA warps + 1 TMA warp
         self.num_mma_warps = self.atom_layout_mnk[0] * self.atom_layout_mnk[1]
         self.mma_warp_ids = tuple(range(self.num_mma_warps))
         self.tma_warp_id = self.num_mma_warps
@@ -268,6 +291,7 @@ class Gemm_TC:
 
         # ====== TMA warp (producer) ======
         if is_tma_warp:
+            # cute.arch.setmaxregister_decrease(40)
             # Prefetch: fill all pipeline stages
             for kidx in range(self.num_stages):
                 mainloop_pipeline.producer_acquire(producer_state)
@@ -310,6 +334,7 @@ class Gemm_TC:
 
         # ====== MMA warps (consumer) ======
         if is_mma_warp:
+            # cute.arch.setmaxregister_increase(232)
             tCrC.fill(0.0)
 
             for kidx in range(num_k_tiles):

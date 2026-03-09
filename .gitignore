@@ -37,4 +37,5 @@ cutlass/
 *.so
 
 # AI-assistance
-.claude/todo.md
+.claude/
+.github/agents

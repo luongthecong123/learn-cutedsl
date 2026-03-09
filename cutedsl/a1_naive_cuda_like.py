@@ -30,19 +30,19 @@ def naive_kernel(
     bdimx, bdimy, _ = cute.arch.block_dim()
     tidx, tidy, _ = cute.arch.thread_idx()
     
-    acc = cute.Float32(0)
+    acc = 0.0
     
     for k in range(K):
-        acc += cute.Float32(gA[bidy * bdimy + tidy, k]) * cute.Float32(gB[bidx * bdimx + tidx, k])
+        acc += gA[bidy * bdimy + tidy, k] * gB[bidx * bdimx + tidx, k]
     
-    gC[bidy * bdimy + tidy, bidx * bdimx + tidx] = cute.Float16(acc)
+    gC[bidy * bdimy + tidy, bidx * bdimx + tidx] = acc
 
 def main():
-    M, N, K = 256, 256, 256
+    M, N, K = 1024, 1024, 1024
 
-    A = torch.randn((M, K), device="cuda", dtype=torch.float16)
-    B = torch.randn((N, K), device="cuda", dtype=torch.float16)
-    C = torch.empty((M, N), device="cuda", dtype=torch.float16)
+    A = torch.randn((M, K), device="cuda", dtype=torch.float32)
+    B = torch.randn((N, K), device="cuda", dtype=torch.float32)
+    C = torch.empty((M, N), device="cuda", dtype=torch.float32)
 
     A_ = from_dlpack(A, assumed_align=16)
     B_ = from_dlpack(B, assumed_align=16)

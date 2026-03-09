@@ -41,7 +41,7 @@ class Gemm_TC:
     ):
         self.cta_tile_shape_mnk = cta_tile_shape_mnk
         self.BM, self.BN, self.BK = cta_tile_shape_mnk
-        self.mma_inst_shape_mnk = (self.BM, self.BN, 16)
+        self.mma_inst_shape_mnk = (self.BM,  min(self.BN, 256), 16)
 
         # Warp specialization
         self.epi_warp_ids = (0, 1, 2, 3)
@@ -237,17 +237,13 @@ class Gemm_TC:
             epi_tile,
             use_2cta_instrs=False,
         )
-        # (EPI_TILE_M, EPI_TILE_N)
+
         tAcc_epi = cute.flat_divide(tCtAcc[((None, None), 0, 0)], epi_tile)
         tmem_tiled_copy = tcgen05.make_tmem_copy(copy_atom_t2r, tAcc_epi[(None, None, 0, 0)])
         tmem_thr_copy = tmem_tiled_copy.get_slice(tidx)
-
-        # (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
         tTR_tAcc = tmem_thr_copy.partition_S(tAcc_epi)
         tCgC_epi = cute.flat_divide(tCgC[((None, None), 0, 0)], epi_tile)
-        # (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
         tTR_gC = tmem_thr_copy.partition_D(tCgC_epi)
-        # (T2R, T2R_M, T2R_N)
         tTR_rAcc = cute.make_rmem_tensor(tTR_gC[(None, None, None, 0, 0)].shape, self.acc_dtype)
         tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
 
@@ -267,10 +263,6 @@ class Gemm_TC:
             self.b_dtype, cute.select(b_smem_layout, mode=[0, 1, 2])
         )
 
-        # AB pipeline: TMA producer (warp 5) → UMMA consumer (warp 4)
-        # PipelineTmaUmma synchronizes TMA loads with tcgen05 MMA consumption
-        # - producer_group: single thread (TMA is issued by 1 thread)
-        # - consumer_group: 1 thread (UMMA is single-thread on tcgen05)
         producer, consumer = pipeline.PipelineTmaUmma.create(
             num_stages=self.num_stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
@@ -280,8 +272,7 @@ class Gemm_TC:
             cta_layout_vmnk=cta_layout_vmnk,
         ).make_participants()
 
-        # Manual mbarrier for UMMA async completion (replaces PipelineUmmaAsync)
-        # tcgen05.commit(mma_mbar) signals when all preceding TMEM writes finish.
+        # Set expected arrival count for mbarrier, TMA is issued by only 1 thread, so the count is 1
         mma_mbar = storage.mma_mbar_ptr.data_ptr()
         if warp_idx == 0 and tidx == 0:
             cute.arch.mbarrier_init(mma_mbar, cnt=1)
@@ -345,6 +336,7 @@ class Gemm_TC:
 
         if warp_idx <= self.epi_warp_ids[-1]:
             subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+            print("subtile_cnt: ", subtile_cnt)
             for subtile_idx in cutlass.range(subtile_cnt):
                 cute.copy(tmem_tiled_copy, tTR_tAcc[(None, None, None, subtile_idx)], tTR_rAcc)
                 tTR_rC.store(tTR_rAcc.load().to(self.c_dtype))

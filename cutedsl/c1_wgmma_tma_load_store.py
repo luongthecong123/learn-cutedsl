@@ -291,7 +291,7 @@ class Gemm_TC:
         phase = 0
         
         for kidx in range(mA_tma_tensor.shape[1] // self.BK):
-            # I think cute launches using a single thread under the hood, so here if we use only one thread to call the copy, it will cause a deadlock. Hence we call it using the first warp instead.
+            # I think cute launches this tma using a single thread under the hood, so here if we use only one thread to call the copy, it will cause a deadlock. Hence we call it using the first warp instead.
             if warp_idx == 0:
                 cute.copy(
                     tma_atom_a,

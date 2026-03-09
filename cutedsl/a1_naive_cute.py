@@ -33,7 +33,7 @@ def gemm_kernel(gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor):
     
     # Tile the universal mma atom (1x1) to shape atoms_layout -> 16x16 tiles of this atom
     atoms_layout = cute.make_layout((16, 16, 1), stride=(16, 1, 0))
-    mma_atom = cute.nvgpu.MmaUniversalOp(cutlass.Float16)
+    mma_atom = cute.nvgpu.MmaUniversalOp(cutlass.Float32)
     tiled_mma = cute.make_tiled_mma(mma_atom, atoms_layout)
     print("tiled mma: ", tiled_mma)
 
@@ -44,7 +44,7 @@ def gemm_kernel(gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor):
     tCgC = thr_mma.partition_C(gC_tile)
     tCrC = tiled_mma.make_fragment_C(tCgC)
 
-    tCrC.fill(cute.Float16(0))
+    tCrC.fill(0)
     print("tCrC begin: ", tCrC)
     
     K_tiles = gA_tile.shape[2]
@@ -75,9 +75,9 @@ def gemm_kernel(gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor):
 def main():
     M, N, K = 1024, 1024, 1024
 
-    A = torch.randn((M, K), device="cuda", dtype=torch.float16)
-    B = torch.randn((N, K), device="cuda", dtype=torch.float16)
-    C = torch.empty((M, N), device="cuda", dtype=torch.float16)
+    A = torch.randn((M, K), device="cuda", dtype=torch.float32)
+    B = torch.randn((N, K), device="cuda", dtype=torch.float32)
+    C = torch.empty((M, N), device="cuda", dtype=torch.float32)
 
     A_ = from_dlpack(A, assumed_align=16)
     B_ = from_dlpack(B, assumed_align=16)

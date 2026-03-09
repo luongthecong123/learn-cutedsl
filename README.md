@@ -1,31 +1,29 @@
 # Learn CuTeDSL
 
-**CuTeDSL** is a Python-embedded domain-specific language that wraps CUDA/PTX. It gives you quality-of-life APIs for writing efficient GPU kernels — think Layout algebra, Swizzle, Copy Atoms, MMA Atoms, TMA descriptors — while staying close enough to the hardware to hit speed-of-light (SoL) performance. Kernels integrate seamlessly with PyTorch via DLPack and compile fast thanks to an MLIR/NVVM backend.
+CuTeDSL offers a simpler alternative to CUTLASS C++ by avoiding template metaprogramming, enabling faster iteration while benefiting from Python tooling such as Pylance and IntelliSense. Despite the higher-level environment, it still allows low-level control through raw PTX and supports both JIT (@cute.jit) and AOT (cute.compile) compilation with zero-copy PyTorch interoperability. Some rough edges remain, including overlapping APIs and limited documentation, with many official examples jumping straight to complex kernels; this repository aims to bridge that gap by adding hardware features and optimization techniques gradually, measuring the FLOPS gain at each step so you see exactly what you are buying. 
 
-This repo adds hardware features and optimization techniques gradually, measuring the FLOPS gain at each step so you see exactly what you are buying. Beyond the kernels, the repo also serves as a **reference for commonly used CuTeDSL APIs**. Each concept — Layout arithmetic, Swizzle composition, TV-to-MN coordinate mapping, `mbarrier` synchronization — is isolated and explained with minimal surrounding noise, making it easy to lift a pattern into your own code or feed it as context to an LLM. Here, you can find kernels for Ampere (SM80), Hopper (SM90), Blackwell (SM100) and Blackwell RTX (SM120).
+Beyond the kernels, the repo also serves as a reference for commonly used CuTeDSL APIs. Each concept is isolated and explained with minimal surrounding noise, making it easy to lift a pattern into your own code or feed it as context to an LLM. Here, you can find kernels for Ampere SM80, Hopper SM90, Blackwell SM100 (B200) and Blackwell SM120 (RTX Pro 6000 Blackwell, RTX 5090, 50s series).
 
-**Why CuTeDSL over CUTLASS C++?**
-- No template metaprogramming maze, much faster iteration and easier to get started
-- Python quality of life: Pylance, Intellisense, preferred language by AIs,...
-- Same low-level control: you can drop to raw PTX whenever you need it
-- JIT compilation (`@cute.jit`) or AOT (`cute.compile`) with PyTorch zero-copy interop
+| Techniques | Script | Architecture | SM90 | SM100 | SM120 |
+|---|---|---|---|---|---|
+| Naïve | [`a1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute.py) | Any | 0.58 | similar | similar |
+| Shared memory | [`a2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a2_smem_cuda_like.py) | Any | 7 | similar | similar |
+| WMMA | [`b2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b2_wmma_smem.py) | SM80+ | 203 | 241 | 295 |
+| WMMA + TMA | [`b5`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b5_wmma_tma_load_store.py) | SM90+ | 355 | 324 | 335 |
+| WMMA + TMA warp-specialized pipeline | [`b7`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b7_wmma_tma_pipeline.py) | SM90+ | 392 | 424 | 343 |
+| WGMMA + TMA | [`c1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c1_wgmma_tma_load_store.py) | SM90 | 532 | - | - |
+| WGMMA + TMA warp-specialized pipeline | [`c2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c2_wgmma_tma_specialized_pipeline.py) | SM90 | 685 | - | - |
+| tcgen05 MMA + TMA | [`d1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/d1_tcgen05_tma_umma.py) | SM100 | - | 717 | - |
+| tcgen05 MMA + TMA warp-specialized pipeline | [`d2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/d2_tcgen05_tma_umma_specialized_pipeline.py) | SM100 | - | 1279 | - |
+| tcgen05 MMA 2CTA + TMA warp-specialized pipeline | [`d3`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/d3_tcgen05_tma_umma_2cta_specialized_pipeline.py) | SM100 | - | 1366 | - |
 
-**Known rough edges:**
-- Many APIs overlap in purpose — the versatility that makes it powerful can also be confusing
-- Documentation is sparse; official examples tend to go straight for SoL complexity
-- This repo exists partly to fill that gap: one concept per script, explained step by step
-
----
-
-**What lies ahead in this document:**
-
-Section 1 walks through the optimization progression with measured FLOPS gains at each step. Section 2 explains the core CuTeDSL APIs you will encounter everywhere: Layout, Shared Memory, Copy Atoms, and MMA Atoms. Section 3 dives into TV Layout for mapping thread registers to `(m, n)` coordinates, enabling layer fusion without materializing large tensors. Section 4 covers TMA and WGMMA together — the two Hopper hardware features that power the async pipeline. Section 5 builds a full async warp-specialized pipeline, contrasting `PipelineAsync` and `PipelineTmaAsync` and the SM120 fallback. Section 6 shows how to profile the pipeline with inline PTX clock reads. Section 7 introduces the Blackwell tcgen05 tensor core instruction.
+We can improve further by using techniques such as Persistent kernel to overlap epilogue with the start of the next tile, TMEM staging in Blackwell,... to reach Speed of Light (CuBLAS) which is around 720 TFLOPS for H100 and 1500 TFLOPS for B200.
 
 ## Frequently used APIs explanation 
 (Click the arrow to expand section)
 
 <details>
-<summary><strong>1. Learning Curve and FLOPS Gain</strong></summary>
+<summary><strong>1. Learning Curve</strong></summary>
 
 CuTeDSL and CUDA in general have a very steep but rewarding learning curve, so don't get frustrated the first time you try it. The best approach is to look at examples, write kernels yourself, and observe the performance speedup — and understand *why* it speeds up. Once you can wrap your head around the concept of massively parallel programming with CUDA, subsequent kernels become much easier to digest.
 
@@ -45,20 +43,7 @@ Suggested progression:
 
 **FLOPS progression** (M=N=K=4096, dtype=float16):
 
-| Stage | Script | Architecture | SM90 (H100) | SM100 (B200) | SM120 (RTX Pro 6K) |
-|---|---|---|---|---|---|
-| Naïve | [`a1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute.py) | Any | 0.58 | similar | similar |
-| Shared memory | [`a2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a2_smem_cuda_like.py) | Any | 7.17 | similar | similar |
-| WMMA | [`b2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b2_wmma_smem.py) | Ampere+ (SM80+) | 203.29 | 241.30 | 295.26 |
-| WMMA + TMA | [`b5`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b5_wmma_tma_load_store.py) | Hopper+ (SM90+) | 355.71 | 324.37 | 340.16 |
-| WMMA + TMA warp-specialized pipeline | [`b7`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b7_wmma_tma_pipeline.py) | Hopper+ (SM90+) | 392.86 | 424.70 | 345.27 |
-| WGMMA + TMA | [`c1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c1_wgmma_tma_load_store.py) | Hopper (SM90) | 532.10 | - | - |
-| WGMMA + TMA warp-specialized pipeline | [`c2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c2_wgmma_tma_specialized_pipeline.py) | Hopper (SM90) | 685.08 | - | - |
-| tcgen05 MMA + TMA | [`d1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/d1_tcgen05_tma_umma.py) | Blackwell (SM100) | - | 717.30 | - |
-| tcgen05 MMA + TMA warp-specialized pipeline | [`d2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/d2_tcgen05_tma_umma_specialized_pipeline.py) | Blackwell (SM100) | - | 1279.36 | - |
-| tcgen05 MMA 2CTA + TMA warp-specialized pipeline | [`d3`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/d3_tcgen05_tma_umma_2cta_specialized_pipeline.py) | Blackwell (SM100) | - | 1366.63 | - |
 
-We can improve further by using techniques such as Persistent kernel to overlap epilogue with the start of the next tile, TMA Multi-cast, TMEM staging in Blackwell,... to reach Speed of Light (CuBLAS) which is around 720 TFLOPS for H100 and 1500 TFLOPS for B200.
 
 </details>
 

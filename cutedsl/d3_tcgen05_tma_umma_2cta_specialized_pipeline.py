@@ -317,7 +317,7 @@ class Gemm_TC:
             cta_layout_vmnk=cta_layout_vmnk,
         ).make_participants()
 
-        # Manual mbarrier for UMMA async completion (replaces PipelineUmmaAsync)
+        # Set expected arrival count for mbarrier, TMA is issued by only 1 thread, so the count is 1
         # tcgen05.commit(mma_mbar) signals when all preceding TMEM writes finish.
         mma_mbar = storage.mma_mbar_ptr.data_ptr()
         if warp_idx == 0 and tidx == 0:
@@ -383,6 +383,7 @@ class Gemm_TC:
 
         if warp_idx <= self.epi_warp_ids[-1]:
             subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+            print("subtile_cnt: ", subtile_cnt)
             for subtile_idx in cutlass.range(subtile_cnt):
                 cute.copy(tmem_tiled_copy, tTR_tAcc[(None, None, None, subtile_idx)], tTR_rAcc)
                 tTR_rC.store(tTR_rAcc.load().to(self.c_dtype))
