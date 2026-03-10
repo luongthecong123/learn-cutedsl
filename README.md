@@ -1,28 +1,9 @@
 # Learn CuTeDSL
 
-Writing a high-performance GEMM kernel in CUTLASS C++ means navigating nested template metaprogramming across hundreds of header files — a single typo in a type alias can produce compiler errors that span pages. CuTeDSL replaces that entire workflow with Python: the same hardware instructions, the same tiling abstractions, but expressed through a JIT/AOT compilation pipeline (@cute.jit and cute.compile) with zero-copy PyTorch interop via DLPack. You get Pylance autocompletion, single-file self-contained kernels, and the escape hatch of writing inline PTX whenever CuTeDSL's API surface falls short. Some rough edges remain — overlapping APIs and documentation gaps mean you will occasionally read CUTLASS C++ source to understand what a Python wrapper does — but the iteration speed improvement is dramatic: what took hours of template debugging now takes minutes of Python experimentation.
-
-Beyond the kernels, the repo also serves as a reference for commonly used CuTeDSL APIs. Each concept is isolated and explained with minimal surrounding noise, making it easy to lift a pattern into your own code or feed it as context to an LLM. Here, you can find kernels for Ampere SM80, Hopper SM90, Blackwell SM100 (B200) and Blackwell SM120 (RTX Pro 6000 Blackwell, RTX 5090, 50s series).
-
-TFLOPS progression (M=N=K=4096, dtype=float16):
-| Techniques | Script | Architecture | SM90 | SM100 | SM120 |
-|---|---|---|---|---|---|
-| Naïve | [`a1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute.py) | Any | 0.58 | similar | similar |
-| Shared memory | [`a2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a2_smem_cuda_like.py) | Any | 7 | similar | similar |
-| WMMA CUDA C++ | [`b2.cuh`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cuda/kernels/b2_wmma_smem_vec_2D.cuh) | SM80+ | 94 | 197 | 257 |
-| WMMA CuTeDSL | [`b2.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b2_wmma_smem.py) | SM80+ | 203 | 241 | 295 |
-| WMMA + TMA | [`b5`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b5_wmma_tma_load_store.py) | SM90+ | 355 | 324 | 335 |
-| WMMA + TMA warp-specialized pipeline | [`b7`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b7_wmma_tma_specialized_pipeline.py) | SM90+ | 392 | 424 | 343 |
-| WGMMA + TMA | [`c1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c1_wgmma_tma_load_store.py) | SM90 | 532 | - | - |
-| WGMMA + TMA warp-specialized pipeline | [`c2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c2_wgmma_tma_specialized_pipeline.py) | SM90 | 685 | - | - |
-| tcgen05 MMA + TMA | [`d1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/d1_tcgen05_tma_umma.py) | SM100 | - | 717 | - |
-| tcgen05 MMA + TMA warp-specialized pipeline | [`d2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/d2_tcgen05_tma_umma_specialized_pipeline.py) | SM100 | - | 1279 | - |
-| tcgen05 MMA 2CTA + TMA warp-specialized pipeline | [`d3`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/d3_tcgen05_tma_umma_2cta_specialized_pipeline.py) | SM100 | - | 1366 | - |
-
-To close the remaining gap to cuBLAS (~720 TFLOPS on H100, ~1500 TFLOPS on B200), the next step is persistent kernels — a technique that keeps the CTA alive across multiple output tiles, overlapping the epilogue of the current tile with the computation of the next to hide GMEM store latency and eliminate kernel launch overhead. On Hopper, kernel c2 would gain from TMA multicast and CTA clusters that broadcast shared tiles across cooperating CTAs, reducing L2 and HBM traffic. On Blackwell SM100, kernel d3 can exploit TMEM staging: split the 512 TMEM columns into two halves so the epilogue reads from the first 256 columns while the next tile's MMA accumulates into the second 256, achieving true compute-epilogue overlap within a single SM. On SM120 (Blackwell RTX), which lacks WGMMA and UMMA, kernel b7 can benefit from register double-buffering — producer threads fill next-stage fragment registers via LdMatrix while consumer threads execute MMA on the current-stage registers, with a partial-CTA barrier (number_of_threads=num_producer_threads) avoiding the deadlock that a full sync_threads() would cause.
+ CuTeDSL provides quality of life APIs while making sure you have access to the low level hardware to write performant kernels. Here, you can find kernels for Ampere SM80, Hopper SM90, Blackwell SM100 (B200) and Blackwell SM120 (RTX Pro 6000 Blackwell, RTX 5090, 50s series). Beyond the kernels, the repo also serves as a reference for commonly used CuTeDSL APIs. Each concept is isolated and explained with minimal surrounding noise, making it easy to lift a pattern into your own code or feed it as context to an LLM. 
 
 ## Frequently used APIs explanation 
-(Click the arrow to expand section)
+*Click ▶ to expand the section*
 
 <details>
 <summary>1. Overview</summary>
@@ -34,8 +15,6 @@ Each generation of GPU shifts the programmer's burden. On Ampere, you hand-tune 
 The suggested progression through this repository starts with vector addition ([`a0`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a0_vector_addition.py)), the classic gateway CUDA example. Plenty of online explanations exist for this pattern. CUDA has a broader ecosystem of YouTube videos and blog posts than CuTeDSL, but CuTeDSL is essentially a Python wrapper over CUDA/PTX so the concepts transfer directly. From there, naïve GEMM ([`a1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute.py)) introduces how to perform General Matrix Multiplication in a parallel fashion using one thread per output element. The shared memory GEMM ([`a2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a2_smem_cuda_like.py)) then loads tiles of A and B into fast on-chip shared memory to exploit data reuse and reduce global memory traffic, producing the first dramatic FLOPS jump. You can check the folder `cuda/kernels/` to explore CUDA C++ kernels for naive, smem and WMMA, with the files naming convention that map to equivalent ones in `cutedsl/` folder, these CUDA kernels are compiled JIT with ninja, you can run them directly by launching `cuda/gemm_cuda.py` or through modal submission, check function `run_kernel_sm80` in `submit_modal.py` and section `Job_submission` in this repo.
 
 The b-series introduces WMMA (Warp Matrix Multiply-Accumulate) tensor core instructions available from Ampere SM80 onwards. Lei Mao's blog provides excellent tutorial for WMMA instruction: https://leimao.github.io/blog/NVIDIA-Tensor-Core-Programming/. In CuTeDSL and CUTLASS generally, the convention is to map PTX instructions directly rather than going through the CUDA C++ `wmma` API. The c-series moves to Hopper SM90 with TMA (Tensor Memory Accelerator) and WGMMA (Warp Group MMA), combined with new async barrier primitives for true pipelined overlap of memory and compute. Finally, the d-series covers Blackwell's tcgen05 instruction for SM100 and SM120.
-
-
 
 </details>
 
@@ -1119,6 +1098,23 @@ Running [`c2_profile.py`](https://github.com/luongthecong123/learn-cutedsl/blob/
 
 </details>
 
+---
+TFLOPS progression (M=N=K=4096, dtype=float16):
+| Techniques | Script | Architecture | SM90 | SM100 | SM120 |
+|---|---|---|---|---|---|
+| Naïve | [`a1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute.py) | Any | 0.58 | similar | similar |
+| Shared memory | [`a2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a2_smem_cuda_like.py) | Any | 7 | similar | similar |
+| WMMA CUDA C++ | [`b2.cuh`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cuda/kernels/b2_wmma_smem_vec_2D.cuh) | SM80+ | 94 | 197 | 257 |
+| WMMA CuTeDSL | [`b2.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b2_wmma_smem.py) | SM80+ | 203 | 241 | 295 |
+| WMMA + TMA | [`b5`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b5_wmma_tma_load_store.py) | SM90+ | 355 | 324 | 335 |
+| WMMA + TMA warp-specialized pipeline | [`b7`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b7_wmma_tma_specialized_pipeline.py) | SM90+ | 392 | 424 | 343 |
+| WGMMA + TMA | [`c1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c1_wgmma_tma_load_store.py) | SM90 | 532 | - | - |
+| WGMMA + TMA warp-specialized pipeline | [`c2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/c2_wgmma_tma_specialized_pipeline.py) | SM90 | 685 | - | - |
+| tcgen05 MMA + TMA | [`d1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/d1_tcgen05_tma_umma.py) | SM100 | - | 717 | - |
+| tcgen05 MMA + TMA warp-specialized pipeline | [`d2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/d2_tcgen05_tma_umma_specialized_pipeline.py) | SM100 | - | 1279 | - |
+| tcgen05 MMA 2CTA + TMA warp-specialized pipeline | [`d3`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/d3_tcgen05_tma_umma_2cta_specialized_pipeline.py) | SM100 | - | 1366 | - |
+
+To close the remaining gap to cuBLAS (~720 TFLOPS on H100, ~1500 TFLOPS on B200), the next step is persistent kernels — a technique that keeps the CTA alive across multiple output tiles, overlapping the epilogue of the current tile with the computation of the next to hide GMEM store latency and eliminate kernel launch overhead. On Hopper, kernel c2 would gain from TMA multicast and CTA clusters that broadcast shared tiles across cooperating CTAs, reducing L2 and HBM traffic. On Blackwell SM100, kernel d3 can exploit TMEM staging: split the 512 TMEM columns into two halves so the epilogue reads from the first 256 columns while the next tile's MMA accumulates into the second 256, achieving true compute-epilogue overlap within a single SM. On SM120 (Blackwell RTX), which lacks WGMMA and UMMA, kernel b7 can benefit from register double-buffering — producer threads fill next-stage fragment registers via LdMatrix while consumer threads execute MMA on the current-stage registers, with a partial-CTA barrier (number_of_threads=num_producer_threads) avoiding the deadlock that a full sync_threads() would cause.
 
 ## Job Submission
 All files in this repo can be run directly and independantly as each file is self contained (`cuda/gemm_cuda.py` or all files in `cutedsl/*.py`) if you have the hardware at your disposable. Or you can submit these jobs to the cloud to have access to beefier server class GPUs.
