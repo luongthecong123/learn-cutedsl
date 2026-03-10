@@ -80,3 +80,11 @@ struct IndexWrapper
     uint32_t dimensions[num_dim];
     T* m_ptr;
 };
+
+// Maps VEC_SIZE (in number of half elements) to the corresponding vector type for loads/stores
+// VEC_SIZE=1 -> half (2B), VEC_SIZE=2 -> float (4B), VEC_SIZE=4 -> float2 (8B), VEC_SIZE=8 -> float4 (16B)
+template<int VEC_SIZE> struct VecType;
+template<> struct VecType<1> { using type = half; };
+template<> struct VecType<2> { using type = float; };
+template<> struct VecType<4> { using type = float2; };
+template<> struct VecType<8> { using type = float4; };

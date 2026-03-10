@@ -2,7 +2,7 @@
 #include "../cuda_common.cuh"
 
 namespace wmma_smem_vec {
-    template<int BM, int BN, int BK, int WMMA_M, int WMMA_N, int WMMA_K>
+    template<int BM, int BN, int BK, int WMMA_M, int WMMA_N, int WMMA_K, int VEC_SIZE>
     __global__ void __launch_bounds__((BN / WMMA_N) * WARPSIZE * (BM / WMMA_M)) gemm_kernel(
         const half* A,
         const half* B,
@@ -30,8 +30,7 @@ namespace wmma_smem_vec {
         size_t warpIdy = threadIdx.y;
     
         for (int ctak = 0; ctak < K; ctak += BK) {
-            // Load sA, sB with vectorized 128-bit loads (8 half elements)
-            constexpr int VEC_SIZE = 8;  // float4 = 8 halves
+            // Load sA, sB with vectorized loads
             {
                 int numLoads = (BM * BK) / VEC_SIZE;
                 for (int i = tid; i < numLoads; i += numThreads) {
@@ -41,8 +40,9 @@ namespace wmma_smem_vec {
                     int globalCol = ctak + col;
     
                     if (globalRow < M && globalCol < K) {
-                        float4 tmp = *reinterpret_cast<const float4*>(&A_idx.at(globalRow, globalCol));
-                        *reinterpret_cast<float4*>(&sA[row][col]) = tmp;
+                        using vec_t = typename VecType<VEC_SIZE>::type;
+                        vec_t tmp = *reinterpret_cast<const vec_t*>(&A_idx.at(globalRow, globalCol));
+                        *reinterpret_cast<vec_t*>(&sA[row][col]) = tmp;
                     } else {
                         // Pad with zeros if out of bounds
                         #pragma unroll
@@ -62,8 +62,9 @@ namespace wmma_smem_vec {
                     int globalCol = ctak + col;
     
                     if (globalRow < N && globalCol < K) {
-                        float4 tmp = *reinterpret_cast<const float4*>(&B_idx.at(globalRow, globalCol));
-                        *reinterpret_cast<float4*>(&sB[row][col]) = tmp;
+                        using vec_t = typename VecType<VEC_SIZE>::type;
+                        vec_t tmp = *reinterpret_cast<const vec_t*>(&B_idx.at(globalRow, globalCol));
+                        *reinterpret_cast<vec_t*>(&sB[row][col]) = tmp;
                     } else {
                         #pragma unroll
                         for (int j = 0; j < VEC_SIZE; j++) {
@@ -116,7 +117,9 @@ namespace wmma_smem_vec {
     
         constexpr int WARPS_M = BM / WMMA_M;
         constexpr int WARPS_N = BN / WMMA_N;
-    
+
+        constexpr int VEC_SIZE = 8;
+
         dim3 blockSize(WARPS_N * WARPSIZE, WARPS_M);
         dim3 gridSize((N + BN - 1) / BN, (M + BM - 1) / BM);
     
@@ -125,7 +128,7 @@ namespace wmma_smem_vec {
         static_assert(BK % WMMA_K == 0, "BK must be divisible by WMMA_K");
         static_assert(WARPS_M * WARPS_N * WARPSIZE <= 1024, "Too many threads per block");
     
-        gemm_kernel<BM, BN, BK, WMMA_M, WMMA_N, WMMA_K><<<gridSize, blockSize>>>(A, B, C, M, N, K);
+        gemm_kernel<BM, BN, BK, WMMA_M, WMMA_N, WMMA_K, VEC_SIZE><<<gridSize, blockSize>>>(A, B, C, M, N, K);
         CHECK_CUDA_ERROR(cudaGetLastError());
     }
 

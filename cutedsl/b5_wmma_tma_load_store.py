@@ -12,6 +12,7 @@ import torch
 """
 Blackwell SM120 (RTX 5090 or RTX Pro 6000 Blackwell)
 WMMA GEMM with TMA load, single-stage, manual mbarriers.
+Blackwell SM120 doesn't have UMMA instructions.
 
 ALGORITHM:
   - TMA -> sync -> WMMA -> sync -> repeat

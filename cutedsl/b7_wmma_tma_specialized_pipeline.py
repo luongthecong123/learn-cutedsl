@@ -11,6 +11,7 @@ import torch
 """
 Blackwell SM120 (RTX 5090 or RTX Pro 6000 Blackwell)
 WMMA GEMM with TMA load, multi stages pipeline, and warp specialization
+Blackwell SM120 doesn't have UMMA instructions.
 
 Builds on b5 (single-stage TMA + WMMA) by introducing:
   1. Multi-stage software pipeline (PipelineTmaAsync) to overlap TMA loads with WMMA compute

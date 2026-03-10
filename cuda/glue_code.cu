@@ -3,9 +3,9 @@
 #include "kernels/a2_smem.cuh"
 #include "kernels/a3_smem_2D.cuh"
 #include "kernels/b1_wmma_simple.cuh"
-#include "kernels/b2_wmma_smem.cuh"
-#include "kernels/b3_wmma_smem_vec.cuh"
-#include "kernels/b4_wmma_smem_vec_2D.cuh"
+#include "kernels/b1a_wmma_smem.cuh"
+#include "kernels/b1b_wmma_smem_vec.cuh"
+#include "kernels/b2_wmma_smem_vec_2D.cuh"
 
 
 void gemm_cuda(

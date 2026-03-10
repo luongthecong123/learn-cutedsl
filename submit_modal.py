@@ -13,12 +13,19 @@ image = (
     .entrypoint([])
     .uv_pip_install("torch", "nvidia-cutlass-dsl", "ninja")
     .add_local_dir(CURRENT_DIR / "cutedsl", remote_path="/root/cutedsl")
+    .add_local_dir(CURRENT_DIR / "cuda", remote_path="/root/cuda")
 )
 
 app = modal.App("learn-cutedsl", image=image)
 
 @app.function(gpu="A100")
 def run_kernel_sm80():
+    import sys
+    sys.path.insert(0, "/root")
+    print("SM80 cuda/gemm_cuda.py")
+    from cuda.gemm_cuda import main
+    main()
+    
     print("SM80 b2_wmma_smem.py")
     from cutedsl.b2_wmma_smem import main
     main()
@@ -51,11 +58,9 @@ def run_kernel_sm100():
     # print("SM100 d1_tcgen05_tma_umma.py")
     # from cutedsl.d1_tcgen05_tma_umma import main
     # main()
-
     # print("SM100 d1_tcgen05_tma_umma_ld.py")
     # from cutedsl.d1_tcgen05_tma_umma_ld import main
     # main()
-    
     # print("SM100 d2_tcgen05_tma_specialized_pipeline.py")
     # from cutedsl.d2_tcgen05_tma_umma_specialized_pipeline import main
     # main()
@@ -63,8 +68,7 @@ def run_kernel_sm100():
     print("SM100 d3_tcgen05_tma_umma_2cta_specialized_pipeline.py")
     from cutedsl.d3_tcgen05_tma_umma_2cta_specialized_pipeline import main
     main()
-    
-
+      
     
     
 @app.local_entrypoint()

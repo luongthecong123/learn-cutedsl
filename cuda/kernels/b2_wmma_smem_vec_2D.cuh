@@ -3,7 +3,7 @@
 
 namespace wmma_smem_vec_2D {
 
-    template<int BM, int BN, int BK, int WMMA_M, int WMMA_N, int WMMA_K, int WARP_TILING_X, int WARP_TILING_Y>
+    template<int BM, int BN, int BK, int WMMA_M, int WMMA_N, int WMMA_K, int WARP_TILING_X, int WARP_TILING_Y, int VEC_SIZE>
     __global__ void __launch_bounds__((BN / WMMA_N / WARP_TILING_Y) * WARPSIZE * (BM / WMMA_M / WARP_TILING_X))
     gemm_kernel_2d_warp_tiling(
         const half* A,
@@ -40,8 +40,7 @@ namespace wmma_smem_vec_2D {
         size_t warpIdy = threadIdx.y;
 
         for (int ctak = 0; ctak < K; ctak += BK) {
-            // Load sA, sB with vectorized 128-bit loads (8 half elements)
-            constexpr int VEC_SIZE = 8;  // float4 = 8 halves
+            // Load sA, sB with vectorized loads
             {
                 int numLoads = (BM * BK) / VEC_SIZE;
 // #pragma unroll
@@ -52,8 +51,9 @@ namespace wmma_smem_vec_2D {
                     int globalCol = ctak + col;
 
                     if (globalRow < M && globalCol < K) {
-                        float4 tmp = *reinterpret_cast<const float4*>(&A_idx.at(globalRow, globalCol));
-                        *reinterpret_cast<float4*>(&sA[row][col]) = tmp;
+                        using vec_t = typename VecType<VEC_SIZE>::type;
+                        vec_t tmp = *reinterpret_cast<const vec_t*>(&A_idx.at(globalRow, globalCol));
+                        *reinterpret_cast<vec_t*>(&sA[row][col]) = tmp;
                     } else {
                         // #pragma unroll
                         for (int j = 0; j < VEC_SIZE; j++) {
@@ -73,8 +73,9 @@ namespace wmma_smem_vec_2D {
                     int globalCol = ctak + col;
 
                     if (globalRow < N && globalCol < K) {
-                        float4 tmp = *reinterpret_cast<const float4*>(&B_idx.at(globalRow, globalCol));
-                        *reinterpret_cast<float4*>(&sB[row][col]) = tmp;
+                        using vec_t = typename VecType<VEC_SIZE>::type;
+                        vec_t tmp = *reinterpret_cast<const vec_t*>(&B_idx.at(globalRow, globalCol));
+                        *reinterpret_cast<vec_t*>(&sB[row][col]) = tmp;
                     } else {
                         // #pragma unroll
                         for (int j = 0; j < VEC_SIZE; j++) {
@@ -143,16 +144,18 @@ namespace wmma_smem_vec_2D {
         half* C,
         int M, int N, int K
     ){
-        constexpr int BM = 64;
+        constexpr int BM = 128;
         constexpr int BN = 128;
-        constexpr int BK = 16;
+        constexpr int BK = 64;
 
         constexpr int WMMA_M = 16;
         constexpr int WMMA_N = 16;
         constexpr int WMMA_K = 16;
 
-        constexpr int WARP_TILING_X = 1;
+        constexpr int WARP_TILING_X = 2;
         constexpr int WARP_TILING_Y = 2;
+        
+        constexpr int VEC_SIZE = 8;
 
         // Each warp now handles WARP_TILING_X x WARP_TILING_Y tiles
         constexpr int WARPS_M = BM / WMMA_M / WARP_TILING_X;
@@ -166,7 +169,7 @@ namespace wmma_smem_vec_2D {
         static_assert(BK % WMMA_K == 0, "BK must be divisible by WMMA_K");
         static_assert(WARPS_M * WARPS_N * WARPSIZE <= 1024, "Too many threads per block");
 
-        gemm_kernel_2d_warp_tiling<BM, BN, BK, WMMA_M, WMMA_N, WMMA_K, WARP_TILING_X, WARP_TILING_Y>
+        gemm_kernel_2d_warp_tiling<BM, BN, BK, WMMA_M, WMMA_N, WMMA_K, WARP_TILING_X, WARP_TILING_Y, VEC_SIZE>
             <<<gridSize, blockSize>>>(A, B, C, M, N, K);
         CHECK_CUDA_ERROR(cudaGetLastError());
     }

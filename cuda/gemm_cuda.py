@@ -79,3 +79,46 @@ def gemm_cuda_func(
     gemm_cuda_compiled.gemm(matA, matB, matC, M, N, K, ALGO_MAP[algo])
 
     return matC
+
+
+def main():
+    M, N, K = 4096, 4096, 4096
+    WARMUP, ITERS = 1, 5
+    WARMUP_WMMA, ITERS_WMMA = 2, 20
+
+    A = torch.randn((M, K), device="cuda", dtype=torch.float16)
+    B = torch.randn((N, K), device="cuda", dtype=torch.float16)
+    ref = torch.matmul(A, B.T)
+
+    for algo in ALGO_MAP:
+        C = gemm_cuda_func(A, B, algo)
+        ok = torch.allclose(C, ref, atol=1e-1, rtol=1e-1)
+
+        # Search string, if has wmma, then use _WMMA benchmark settings
+        if "wmma" in algo:
+            warmup = WARMUP_WMMA
+            iters = ITERS_WMMA
+        else:
+            warmup = WARMUP
+            iters = ITERS
+
+        # Warmup
+        for _ in range(warmup):
+            gemm_cuda_func(A, B, algo)
+        torch.cuda.synchronize()
+
+        start = torch.cuda.Event(enable_timing=True)
+        end   = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(iters):
+            gemm_cuda_func(A, B, algo)
+        end.record()
+        torch.cuda.synchronize()
+
+        ms = start.elapsed_time(end) / iters          # ms per iteration
+        tflops = (2 * M * N * K) / (ms * 1e9)        # TFLOPS
+        print(f"[{algo:>18s}]  {'PASS' if ok else 'FAIL'}  {ms:7.3f} ms  {tflops:6.2f} TFLOPS")
+
+
+if __name__ == "__main__":
+    main()
