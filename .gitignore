@@ -39,3 +39,6 @@ cutlass/
 # AI-assistance
 .claude/
 .github/agents
+
+# Other
+sub.sh

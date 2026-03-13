@@ -463,6 +463,13 @@ Why do tensor cores exist? Because moving data is far more expensive than comput
 
 Each generation of NVIDIA datacenter GPU ships a new tensor core instruction with a larger MMA shape, a wider thread participation group, and a progressively more asynchronous execution model. The largest dense fp16/bf16 instruction shape tells the story: Ampere's WMMA atom is 16x8x16 — a single warp of 32 threads issues a synchronous multiply that completes before the next instruction begins, accumulating into per-thread registers. Hopper's WGMMA pushes this to 64x256x16 — a warpgroup of 128 threads issues an asynchronous instruction whose operands are read directly from shared memory via matrix descriptors rather than from registers, and whose completion is tracked through an explicit commit/wait protocol. Blackwell's tcgen05 MMA reaches 256x256x16 across a cooperative pair of CTAs — operands come from shared memory, results land in a dedicated Tensor Memory (TMEM) scratchpad per SM, and a single thread can initiate the entire operation. Smaller precisions scale the K dimension: fp8 doubles K to 32, and fp4 quadruples it to 64, keeping the operand bandwidth per instruction constant while multiplying arithmetic throughput. Each successive generation trades programming simplicity for throughput — the synchronization protocol grows more involved, but the reward is a dramatic reduction in data movement overhead and tensor core idle time. This section walks through all three instructions as implemented in CuTeDSL, covering the API, the fragment layout, and the synchronization barriers each one requires.
 
+Table: Comparison of supported shapes for Dense FP16 Tensor Core instructions on Ampere, Hopper, Blackwell
+| Architecture | Instruction | Supported Shapes | Notes |
+| :--- | :--- | :--- | :--- |
+| **Ampere** (SM 80+) | `mma.sync` | $16 \times 8 \times 16$<br>$16 \times 8 \times 8$<br>$8 \times 8 \times 4$ | $K=16$ is the standard for dense FP16; <br> $K=8$ and $K=4$ are legacy. |
+| **Hopper** (SM 90+) | `wgmma.mma_async` | $64 \times N \times 16$<br> | $N$ must be a multiple of 8 up to 256 |
+| **Blackwell** (SM 100+) | `tcgen05.mma` | $64 \times N \times 16$<br>$128 \times N \times 16$<br>$256 \times N \times 16$ (2 CTA) | $N$ must be a multiple of 8 up to 256. <br> $M=256$ requires 2 CTA mma |
+
 ### 4.1. Warp Matrix Multiply-Accumulate (WMMA)
 
 WMMA is the tensor core instruction available starting from Ampere (SM80). Unlike its successor WGMMA, it operates at warp granularity — all 32 threads in a warp collectively execute the instruction, and it completes synchronously before subsequent instructions begin. This makes WMMA straightforward to reason about: no commit-group, no wait-group, no async proxy fencing. A simple `sync_threads()` before reading SMEM is sufficient to ensure TMA or manual copy operations have landed, and the `cute.gemm` call itself returns only after the MMA is complete.
@@ -1100,11 +1107,13 @@ Running [`c2_profile.py`](https://github.com/luongthecong123/learn-cutedsl/blob/
 
 ---
 TFLOPS progression (M=N=K=4096, dtype=float16):
-| Techniques | Script | Architecture | SM90 | SM100 | SM120 |
+Note that the CUDA C++ uses dynamic shape while the CuTeDSL uses static shape.
+Static shape compilation makes the kernel only work with the M, N, K shape that it was compiled with through `from_dlpack`. This op converts `torch.Tensor` to the fully static type `cute.Tensor`, this allows the compiler to perform aggressive loop unrolling and optimization. Script `a1_naive_cute_dynamic.py` shows how to use dynamic layout or partial dynamic to make the compiled code reusable.
+| Techniques | Script | Requires | SM90 | SM100 | SM120 |
 |---|---|---|---|---|---|
 | Naïve | [`a1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute.py) | Any | 0.58 | similar | similar |
 | Shared memory | [`a2`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a2_smem_cuda_like.py) | Any | 7 | similar | similar |
-| WMMA CUDA C++ | [`b2.cuh`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cuda/kernels/b2_wmma_smem_vec_2D.cuh) | SM80+ | 94 | 197 | 257 |
+| WMMA CUDA C++ dynamic shapes| [`b2.cuh`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cuda/kernels/b2_wmma_smem_vec_2D.cuh) | SM80+ | 94 | 197 | 257 |
 | WMMA CuTeDSL | [`b2.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b2_wmma_smem.py) | SM80+ | 203 | 241 | 295 |
 | WMMA + TMA | [`b5`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b5_wmma_tma_load_store.py) | SM90+ | 355 | 324 | 335 |
 | WMMA + TMA warp-specialized pipeline | [`b7`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/b7_wmma_tma_specialized_pipeline.py) | SM90+ | 392 | 424 | 343 |
