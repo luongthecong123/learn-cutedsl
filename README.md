@@ -44,7 +44,7 @@ def my_kernel(...):
   tidx, tidy, _ = cute.arch.thread_idx()
   ```
 
-### 2.2. Interfacing with PyTorch
+### 2.2. Interfacing with PyTorch and Compilation
 
 #### 2.2.1. Traditional CUDA C++ Extension Workflow
 
@@ -98,6 +98,85 @@ A_ = from_dlpack(A, assumed_align=16)   # wrap a torch.Tensor as a cute.Tensor
 ```
 
 CuTeDSL handles the bridge via MLIR/NVVM — no `pybind11` bindings, no `.cu`/`.cpp` glue files, no manual `data_ptr()` casting. Compilation is also faster thanks to an incremental JIT cache.
+
+#### 2.2.3. CuTeDSL compilation and Dump PTX and CUBIN
+
+CuTeDSL offers two compilation paths — **default (DLPack)** and **TVM FFI** — each suited to different workflows.
+
+**Default compilation** wraps live PyTorch tensors via `from_dlpack`, which shares the GPU pointer with CuTeDSL without copying data. The shape, stride, and alignment information are read directly from the tensor:
+
+```python
+from cutlass.cute.runtime import from_dlpack
+
+A_ = from_dlpack(A, assumed_align=16)
+B_ = from_dlpack(B, assumed_align=16)
+C_ = from_dlpack(C, assumed_align=16)
+
+compiled = cute.compile(cute_naive, A_, B_, C_)
+compiled(A_, B_, C_)
+```
+*Used in [`a1_naive_cute.py` main()](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute.py#L75). This compiles a kernel specialized to the exact shapes and strides of the provided tensors.*
+
+**TVM FFI compilation** uses fake tensors — lightweight placeholders that carry shape, dtype, stride order, and alignment metadata but hold no actual data. This lets you compile a kernel once without allocating GPU memory, and call the resulting function with any tensor that satisfies the declared constraints. The compiled TVM FFI function accepts `torch.Tensor` objects directly (no `from_dlpack` wrapping needed at call time), providing a faster eager invocation path:
+
+```python
+BS = cute.sym_int()                  # symbolic (dynamic) batch dimension
+M, N, K = 1024, 1024, 1024          # static dimensions
+
+A_fake = cute.runtime.make_fake_compact_tensor(
+    cute.Float32, (BS, M, K), stride_order=(2, 1, 0), assumed_align=16)
+B_fake = cute.runtime.make_fake_compact_tensor(
+    cute.Float32, (BS, N, K), stride_order=(2, 1, 0), assumed_align=16)
+C_fake = cute.runtime.make_fake_compact_tensor(
+    cute.Float32, (BS, M, N), stride_order=(2, 1, 0), assumed_align=16)
+
+compiled = cute.compile(cute_naive, A_fake, B_fake, C_fake, options="--enable-tvm-ffi")
+
+# Call with real torch tensors — no from_dlpack needed
+compiled(A, B, C)
+```
+*Used in [`a1_naive_cute_tvm_ffi_fake_tensors.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute_tvm_ffi_fake_tensors.py).*
+
+**Static vs. dynamic shapes.** Dimensions passed as Python `int` (e.g. `M = 1024`) are baked into the generated kernel as compile-time constants, enabling aggressive optimizations like loop unrolling. Dimensions declared with `cute.sym_int()` remain dynamic — the kernel accepts any value at runtime. You can also attach divisibility constraints (`cute.sym_int(divisibility=16)`) so the compiler can still generate aligned loads and unroll by that factor. A common pattern is to keep batch size dynamic while fixing the problem dimensions (M, N, K) statically.
+
+With `from_dlpack`, you can achieve a similar effect using `mark_compact_shape_dynamic`:
+
+```python
+A_ = from_dlpack(A, assumed_align=16).mark_compact_shape_dynamic(
+    mode=0, stride_order=A.dim_order())   # mode 0 (batch) is dynamic, rest static
+```
+
+**`assumed_align` matters for performance.** When the compiler knows the base pointer is 16-byte aligned (4 × `float32`), it can emit 128-bit vectorized loads (`ld.global.v4.f32`) that fetch 4 floats per instruction. Without alignment information, it falls back to scalar loads (`ld.global.f32`) — one float per instruction, 4× more memory transactions — which can cause a ~2× wall-clock slowdown on memory-bound kernels. Always pass `assumed_align=16` for `float32` tensors (or `assumed_align=32` for wider types) in both `from_dlpack` and `make_fake_compact_tensor`.
+
+**`stride_order` convention.** CuTe's convention assigns lower order numbers to higher-priority (faster-varying) dimensions. For a row-major tensor of shape `(BS, M, K)`, the innermost dimension is K (stride 1), then M, then BS — so `stride_order=(2, 1, 0)`. Note this is the reverse of PyTorch's `dim_order()` which returns `(0, 1, 2)` for the same tensor. When using `mark_compact_shape_dynamic`, pass `stride_order=A.dim_order()` which uses PyTorch's convention directly — the API handles the translation internally.
+
+**Dumping generated PTX and CUBIN for performance debugging.** When investigating performance issues, inspecting the generated PTX reveals exactly what load/store patterns and instruction scheduling the compiler chose. Pass the environment variables inline so they apply only to the current run without changing your shell defaults:
+
+```bash
+# Dump PTX to /tmp/my_ptx_dump/ for a single run
+CUTE_DSL_KEEP_PTX=1 CUTE_DSL_DUMP_DIR=/tmp/my_ptx_dump python cutedsl/a1_naive_cute.py
+
+# Dump both PTX and CUBIN
+CUTE_DSL_KEEP_PTX=1 CUTE_DSL_KEEP_CUBIN=1 CUTE_DSL_DUMP_DIR=/tmp/my_ptx_dump python cutedsl/a1_naive_cute.py
+```
+
+To get SASS (the final machine code) from a CUBIN, use `nvdisasm` (installed with the CUDA toolkit):
+
+```bash
+nvdisasm /tmp/my_ptx_dump/your_kernel.sm_89.cubin > your_kernel.sass
+```
+
+The dumped contents can also be accessed programmatically from the compiled kernel object:
+
+```python
+compiled = cute.compile(foo, ...)
+
+print(compiled.__ptx__)       # generated PTX source
+print(compiled.__mlir__)      # generated MLIR IR
+
+with open("foo.cubin", "wb") as f:
+    f.write(compiled.__cubin__)   # generated CUBIN binary
+```
 
 ### 2.3. Threads and Blocks — the CUDA Execution Model
 
@@ -1107,8 +1186,7 @@ Running [`c2_profile.py`](https://github.com/luongthecong123/learn-cutedsl/blob/
 
 ---
 TFLOPS progression (M=N=K=4096, dtype=float16):
-Note that the CUDA C++ uses dynamic shape while the CuTeDSL uses static shape.
-Static shape compilation makes the kernel only work with the M, N, K shape that it was compiled with through `from_dlpack`. This op converts `torch.Tensor` to the fully static type `cute.Tensor`, this allows the compiler to perform aggressive loop unrolling and optimization. Script `a1_naive_cute_dynamic.py` shows how to use dynamic layout or partial dynamic to make the compiled code reusable.
+Note that the CUDA C++ uses dynamic shape while the CuTeDSL uses static shape. Check section 2.2.3 for more details.
 | Techniques | Script | Requires | SM90 | SM100 | SM120 |
 |---|---|---|---|---|---|
 | Naïve | [`a1`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute.py) | Any | 0.58 | similar | similar |

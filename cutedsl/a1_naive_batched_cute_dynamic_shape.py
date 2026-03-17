@@ -83,13 +83,15 @@ def main():
     B = torch.randn((BS, N, K), dtype=torch.float32, device="cuda")
     C = torch.empty((BS, M, N), dtype=torch.float32, device="cuda")
 
+    print(A.dim_order())
+
     # Partial dynamic: only BS (mode=0) is dynamic, M/N/K stay static
     # A (BS,M,K):(M*K, K, 1) -> mark mode=0 -> (?,M,K):(?,K,1)
     # B (BS,N,K):(N*K, K, 1) -> mark mode=0 -> (?,N,K):(?,K,1)
     # C (BS,M,N):(M*N, N, 1) -> mark mode=0 -> (?,M,N):(?,N,1)
-    A_ = from_dlpack(A, assumed_align=16).mark_compact_shape_dynamic(mode=0)
-    B_ = from_dlpack(B, assumed_align=16).mark_compact_shape_dynamic(mode=0)
-    C_ = from_dlpack(C, assumed_align=16).mark_compact_shape_dynamic(mode=0)
+    A_ = from_dlpack(A, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=A.dim_order())
+    B_ = from_dlpack(B, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=B.dim_order())
+    C_ = from_dlpack(C, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=C.dim_order())
 
     compiled = cute.compile(cute_naive, A_, B_, C_)
     compiled(A_, B_, C_)
@@ -106,9 +108,9 @@ def main():
     B2 = torch.randn((BS2, N, K), dtype=torch.float32, device="cuda")
     C2 = torch.empty((BS2, M, N), dtype=torch.float32, device="cuda")
 
-    A2_ = from_dlpack(A2, assumed_align=16).mark_compact_shape_dynamic(mode=0)
-    B2_ = from_dlpack(B2, assumed_align=16).mark_compact_shape_dynamic(mode=0)
-    C2_ = from_dlpack(C2, assumed_align=16).mark_compact_shape_dynamic(mode=0)
+    A2_ = from_dlpack(A2, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=A2.dim_order())
+    B2_ = from_dlpack(B2, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=B2.dim_order())
+    C2_ = from_dlpack(C2, assumed_align=16).mark_compact_shape_dynamic(mode=0, stride_order=C2.dim_order())
 
     compiled(A2_, B2_, C2_)
 

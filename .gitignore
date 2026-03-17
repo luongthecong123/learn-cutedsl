@@ -42,3 +42,4 @@ cutlass/
 
 # Other
 sub.sh
+cutedsl/b2_wmma_smem_batched.py
