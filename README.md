@@ -1206,6 +1206,15 @@ To close the remaining gap to cuBLAS (~720 TFLOPS on H100, ~1500 TFLOPS on B200)
 - On Blackwell SM100, kernel d3 can exploit TMEM staging: split the 512 TMEM columns into two halves so the epilogue reads from the first 256 columns while the next tile's MMA accumulates into the second 256, achieving true compute-epilogue overlap within a single SM. One can try to do the same with Hopper, but then we need 2 pairs of registers per thread, and the heavy register pressure of WGMMA will prevent us from doing this without register spill.
 - On SM120 (Blackwell RTX), which lacks WGMMA and UMMA, kernel b7 can benefit from register double-buffering — producer threads fill next-stage fragment registers via LdMatrix while consumer threads execute MMA on the current-stage registers, with a partial-CTA barrier (number_of_threads=num_producer_threads) avoiding the deadlock that a full sync_threads() would cause.
 
+Further comparison with Nsight Compute 2026.1 between torch.mm which calls to a maxed out kernel from Nvidia (uses internal compiler nvjet) vs kernel d3 on shape M=N=K=8096 with float16:
+
+| Kernel | UTCHMMA % of peak | Duration | TFLOPS |
+|--------|-------------------|----------|--------|
+| nvjet (torch.mm) | 92.8% | 677 µs | 1624 |
+| CuTeDSL (d3) | 85.5% | 769 µs | 1429 |
+
+The second column is `sm__ops_path_tensor_op_utchmma_src_fp16_dst_fp32_sparsity_off.sum.pct_of_peak_sustained_elapsed` metric, which roughly translates to tensor core non idle time. Just a 7.3% less ide time resulted in a massive 200 TFLOPS gap, which shows the compute power of B200's tensor core instruction (called UTCHMMA in SASS). This difference is mostly coming from the non overlapped epilogue, additionally, this line is responsible for uncoalesced global memory store in my code: [d3 #L390](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/d3_tcgen05_tma_umma_2cta_specialized_pipeline.py#L390) .This line is compiled into a vectorized store `STG.E.128` (128b=16bytes), but it's strided/uncoalesced, meaning it only hits half of the 32-byte sector of L2 cache, hence "this line is responsible for 100% of L2 Theoretical Sectors Global Excessive" and "50% of the total 8388608 sectors". We can fix this by performing TMEM -> RMEM -> SMEM -> GMEM via TMA store. Another interesting distinction is the TMA load instruction used, CuTeDSL calls to 2D TMA Multi-cast `UTMALDG.2D.MULTICAST.2CTA` while the nvjet kernel calls to 3D TMA `UTMALDG.3D.2CTA`, hinting Multi-cast might not be as performant for this case, that's why it's not used by Nvidia devs in their kernel.
+
 ## Job Submission
 All files in this repo can be run directly and independantly as each file is self contained (`cuda/gemm_cuda.py` or all files in `cutedsl/*.py`) if you have the hardware at your disposable. Or you can submit these jobs to the cloud to have access to beefier server class GPUs.
 
