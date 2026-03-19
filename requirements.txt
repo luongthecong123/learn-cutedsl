@@ -1,2 +1,5 @@
 nvidia-cutlass-dsl
 ninja
+# Optional dependencies for tvm ffi compilation. Check section 2.2.3 for more details.
+apache-tvm-ffi
+torch-c-dlpack-ext

@@ -11,7 +11,7 @@ tag = f"{cuda_version}-{flavor}-{operating_sys}"
 image = (
     modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.12")
     .entrypoint([])
-    .uv_pip_install("torch", "nvidia-cutlass-dsl", "ninja")
+    .uv_pip_install("torch", "nvidia-cutlass-dsl", "ninja", "apache-tvm-ffi", "torch-c-dlpack-ext")
     .add_local_dir(CURRENT_DIR / "cutedsl", remote_path="/root/cutedsl")
     .add_local_dir(CURRENT_DIR / "cuda", remote_path="/root/cuda")
 )

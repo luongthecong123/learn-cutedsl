@@ -61,14 +61,17 @@ def gemm_kernel(gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor):
     
     tCgC.store(tCrC.load())
 
+def fake_wrapper(dtype, shape, stride_order, assumed_align):
+    return cute.runtime.make_fake_compact_tensor(dtype=dtype, shape=shape, stride_order=stride_order, assumed_align=assumed_align)
+
 def main():
     BS = cute.sym_int()
     # K = cute.sym_int(divisibility=64)
     K = 1024
     M, N = 1024, 1024
-    A_fake = cute.runtime.make_fake_compact_tensor(cute.Float32, (BS, M, K), stride_order=(2, 1, 0), assumed_align=16)
-    B_fake = cute.runtime.make_fake_compact_tensor(cute.Float32, (BS, N, K), stride_order=(2, 1, 0), assumed_align=16)
-    C_fake = cute.runtime.make_fake_compact_tensor(cute.Float32, (BS, M, N), stride_order=(2, 1, 0), assumed_align=16)
+    A_fake = fake_wrapper(cute.Float32, (BS, M, K), (2, 1, 0), 16)
+    B_fake = fake_wrapper(cute.Float32, (BS, N, K), (2, 1, 0), 16)
+    C_fake = fake_wrapper(cute.Float32, (BS, M, N), (2, 1, 0), 16)
 
     print("TVM FFI compilation")
     compiled = cute.compile(cute_naive, A_fake, B_fake, C_fake, options="--enable-tvm-ffi")
