@@ -24,9 +24,19 @@ def gemm_kernel(gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor):
     
     tiler = (BM, BN, BK)
     coord = (bidx, bidy, None)
-    
     # CTA partitioning
-    # gA_tile(m,n,k) = gA(bidx * BM + m, bidy * BK + k) = ptr_A + (bidx * BM + m) * K + bidy * BK + k
+    # Step 1: use proj=(1, None, 1) to select tiler and coord
+    # cute.select(coord, mode=[0,2])) -> (bidx, None)
+    # cute.select(tiler, mode=[0,2])) -> (BM, BK)
+    
+    # Step 2: divide gA with selected tiler
+    # gA_mk = cute.zipped_divide(gA, cute.select(tiler, mode=[0,2]))) --> ((BM, BK), (M//BM, K//BK))
+    # it means use a tile of shape (BM, BK) to partition gA into (M//BM)x(K//BK) tiles
+    
+    # Step 3: We select a row of tiles in A for now, during the main loop, we will select a corresponding tile in the K dimension
+    # Then we pass (bidx, None) to the second mode of gA_mk to select one of M//BM tiles, and keep K//BK tiles intact
+    # gA = gA_mk[(None, None), (bidx, None)] -> (BM, BK, K//BK)
+    
     gA_tile = cute.local_tile(gA, tiler=tiler, coord=coord, proj=(1, None, 1))
     gB_tile = cute.local_tile(gB, tiler=tiler, coord=coord, proj=(None, 1, 1))
     gC_tile = cute.local_tile(gC, tiler=tiler, coord=coord, proj=(1, 1, None))

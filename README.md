@@ -203,61 +203,7 @@ $$\text{offset} = \sum_i \text{coord}_i \times \text{stride}_i$$
 
 For example, a row-major matrix `A` of shape `(M, K)` has `stride=(K, 1)`. Accessing element at row `r`, column `c` gives offset `r * K + c`. In memory this just means: "skip `r` full rows of `K` elements, then `c` more."
 
-You can implement Layout in CUDA C++ yourself [cuda/cuda_common.cuh #L33](https://github.com/luongthecong123/learn-cutedsl/blob/main/cuda/cuda_common.cuh#L33)
-
-#### 2.4.1. 1-D case: vector addition ([`a0_vector_addition.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a0_vector_addition.py))
-
-The simplest example — each thread computes a single linear index and indexes directly:
-
-```python
-# a0_vector_addition.py L29-L33
-bidx, _, _ = cute.arch.block_idx()
-bdimx, _, _ = cute.arch.block_dim()
-tidx, _, _ = cute.arch.thread_idx()
-
-i = bidx * bdimx + tidx   # global thread index = linear memory offset
-gC[i] = gA[i] + gB[i]    # stride=1 → offset == index
-```
-
-Here the tensor has `shape=(N,), stride=(1,)`, so the offset formula reduces to just `i * 1 = i` — no multi-dimensional arithmetic needed.
-
-#### 2.4.2. 2-D case: naïve GEMM ([`a1_naive_cuda_like.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cuda_like.py))
-
-In a naïve GEMM, each thread owns one output element `C[row, col]`. The 2-D index must be converted to a linear memory offset:
-
-```python
-# a1_naive_cuda_like.py L37-L40
-for k in range(K):
-    acc += cute.Float32(gA[bidy * bdimy + tidy, k]) * cute.Float32(gB[bidx * bdimx + tidx, k])
-
-gC[bidy * bdimy + tidy, bidx * bdimx + tidx] = cute.Float16(acc)
-```
-
-When you write `gA[row, col]`, CuTeDSL uses the Layout of `gA` to compute the pointer offset automatically:
-
-$$\text{offset}_A = \text{row} \times K + \text{col} \times 1$$
-
-For `A` of shape `(M, K)` stored row-major, `stride=(K, 1)`. So `gA[row, k]` reads from `base_ptr + row * K + k`. No manual offset arithmetic is needed — the Layout carries the stride information.
-
-#### 2.4.3. Tiling: going from elements to blocks ([`a1_naive_cute.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute.py))
-
-Rather than computing per-element offsets manually, `cute.local_tile` slices the global tensor into CTA-sized tiles. The resulting sub-tensor still carries a Layout, so all further indexing remains clean:
-
-```python
-# a1_naive_cute.py L29-L31
-tiler = (BM, BN, BK)
-coord = (bidx, bidy, None)   #  We launched 2D grid, so the third dim is None
-
-gA_tile = cute.local_tile(gA, tiler=tiler, coord=coord, proj=(1, None, 1))
-gB_tile = cute.local_tile(gB, tiler=tiler, coord=coord, proj=(None, 1, 1))
-gC_tile = cute.local_tile(gC, tiler=tiler, coord=coord, proj=(1, 1, None))
-```
-
-`proj` masks out which dimensions are "owned" by the CTA. For `gA_tile`, `proj=(1, None, 1)` means use BM and BK of `tiler` respectively, and leave the inner K-iteration axis free so the kernel can loop over it. The pointer arithmetic for the tile origin is:
-
-$$\text{base\_A\_tile} = \text{base\_A} + \text{bidx} \times BM \times K + \text{bidy} \times BK$$
-
-This is computed once by `local_tile` and encoded into the sub-tensor's Layout; subsequent indexing within the tile uses only small local coordinates.
+You can implement Layout yourself in CUDA C++  [cuda/cuda_common.cuh #L33](https://github.com/luongthecong123/learn-cutedsl/blob/main/cuda/cuda_common.cuh#L33)
 
 **Construction:**
 ```python
@@ -276,14 +222,6 @@ coord = cute.idx2crd(idx, shape)
 ```
 *Used in [`z1_tv2mn.py` L16–L25](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/z1_tv2mn.py#L16) to decode thread/register indices into logical (m, n) output coordinates.*
 
-**Tiling a global tensor into CTA-sized tiles:**
-```python
-# cute.local_tile(tensor, tiler, coord, proj)
-# Returns the sub-tile of `tensor` that this CTA is responsible for.
-gA_tile = cute.local_tile(gA, tiler=tiler, coord=coord, proj=(1, None, 1))
-```
-*Used in [`a1_naive_cute.py` L30](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute.py#L30). `proj` masks out dimensions so the tile retains the K-iteration axis.*
-
 **Swizzle-composed Layout:**
 
 Bank conflicts occur when multiple threads in a warp access different addresses that map to the same shared memory bank. A **Swizzle** applies an XOR permutation to the row address, spreading accesses across banks. `make_swizzle(B, M, S)` defines the XOR pattern via three bit-field parameters.
@@ -299,6 +237,67 @@ layout_sA_swizzled = cute.make_composed_layout(
 ```
 *Used in [`a2_smem_cuda_swizzled.py` L35–L39](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a2_smem_cuda_swizzled.py#L35). See [`z0_swizzle.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/z0_swizzle.py#L7) for a standalone swizzle demo.*
 
+
+#### 2.4.1. 1-D case: vector addition ([`a0_vector_addition.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a0_vector_addition.py))
+
+The simplest example — each thread computes a single linear index and indexes directly:
+
+```python
+# a0_vector_addition.py L29-L33
+bidx, _, _ = cute.arch.block_idx()
+bdimx, _, _ = cute.arch.block_dim()
+tidx, _, _ = cute.arch.thread_idx()
+
+i = bidx * bdimx + tidx   # global thread index = linear memory offset
+gC[i] = gA[i] + gB[i]    # stride=1 → offset == index
+```
+
+Here the tensor has `shape=(N,), stride=(1,)`, so the offset formula reduces to just `i * 1 = i` — no multi-dimensional arithmetic needed.
+
+#### 2.4.2. 2-D case: naïve GEMM the cuda way ([`a1_naive_cuda_like.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cuda_like.py))
+
+In a naïve GEMM written the cuda way, you can calculate linear memory offset like this
+
+```python
+# a1_naive_cuda_like.py L37-L40
+for k in range(K):
+    acc += cute.Float32(gA[bidy * bdimy + tidy, k]) * cute.Float32(gB[bidx * bdimx + tidx, k])
+
+gC[bidy * bdimy + tidy, bidx * bdimx + tidx] = cute.Float16(acc)
+```
+
+In CuteDSL, you simplify this with `gA[row, col]`, CuTe can infer the Layout of A from `gA` to compute the pointer offset automatically:
+
+$$\text{offset}_A = \text{row} \times K + \text{col} \times 1$$
+
+For `A` of shape `(M, K)` stored row-major, `stride=(K, 1)`. So `gA[row, k]` reads from `base_ptr + row * K + k`. No manual offset arithmetic is needed — the Layout carries the stride information.
+
+#### 2.4.3. Tiling: going from elements to blocks ([`a1_naive_cute.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute.py))
+
+Rather than computing per-element offsets manually, `cute.local_tile` slices the global tensor into CTA-sized tiles. The resulting sub-tensor still carries a Layout, so all further indexing remains clean:
+
+```python
+# a1_naive_cute.py L29-L31
+tiler = (BM, BN, BK)
+coord = (bidx, bidy, None)   #  We launched 2D grid, so the third dim is None
+
+gA_tile = cute.local_tile(gA, tiler=tiler, coord=coord, proj=(1, None, 1))
+gB_tile = cute.local_tile(gB, tiler=tiler, coord=coord, proj=(None, 1, 1))
+gC_tile = cute.local_tile(gC, tiler=tiler, coord=coord, proj=(1, 1, None))
+```
+Under the hood, `local_tile` is a convenience wrapper that combines three primitives: `select`, `zipped_divide`, and coordinate indexing. Understanding each step is essential when you need finer control. The line `gA_tile = cute.local_tile(gA, tiler=tiler, coord=coord, proj=(1, None, 1))` is equivalent to:
+```python
+gA_mk = cute.zipped_divide(gA, cute.select(tiler, mode=[0,2]))
+# gA_mk shape: ((BM, BK), (M//BM, K//BK))
+
+gA_tile = gA_mk[(None, None), (bidx, None)]
+# Result shape: (BM, BK, K//BK)
+```
+Step 1: `proj=(1, None, 1)` means using `cute.select` to extract the relevant dimensions from the tiler and coordinate tuples using a mode list. `cute.select(tiler, mode=[0,2])` yields `(BM, BK)` and `cute.select(coord, mode=[0,2])` yields `(bidx, None)`.
+
+Step 2: `cute.zipped_divide(gA, cute.select(tiler, mode=[0,2]))` divides gA with the selected tiler `(BM, BK)`. This partitions gA of shape `(M, K)` into a hierarchical tensor of shape `((BM, BK), (M//BM, K//BK))`. It means we use a tile of shape `(BM, BK)` to partition gA into `(M//BM) x (K//BK)` tiles.
+
+Step 3: We select a row of tiles in A using bidx for now, we will select a corresponding tile in the K dimension later during the main loop. We pass `(bidx, None)` to the second mode of `gA_mk` to select one of `M//BM` tiles, and keep `K//BK` tiles intact. In CuTeDSL, you index into the result using bracket syntax with nested tuples that match the hierarchical shape structure:
 
 ### 2.5. Shared Memory
 
