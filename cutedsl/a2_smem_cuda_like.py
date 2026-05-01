@@ -4,15 +4,15 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.testing import benchmark, JitArguments
 import torch
 
+BM, BN, BK =  16, 32, 64
+
 @cute.jit
 def naive_smem_launcher(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
     M = mA.shape[0]
     N = mB.shape[0]
     K = mA.shape[1]
     
-    BM, BN, BK =  16, 16, 16
-    
-    naive_smem_kernel(mA, mB, mC, M, N, K, BM, BN, BK).launch(
+    naive_smem_kernel(mA, mB, mC, M, N, K).launch(
         grid=[N // BN, M // BM, 1],
         block=[BM, BN, 1])
 
@@ -21,12 +21,10 @@ def naive_smem_kernel(
     gA: cute.Tensor,  # [M, K]
     gB: cute.Tensor,  # [N, K]
     gC: cute.Tensor,  # [M, N]
-    M: int, N: int, K: int,
-    BM: int, BN: int, BK: int
+    M: int, N: int, K: int
 ):
-    BM, BN, BK =  16, 16, 16
+
     PAD = 8
-    
     # Define and allocate shared memory
     allocator = cutlass.utils.SmemAllocator()
     layout_sA = cute.make_layout((BM, BK), stride=(BK + PAD, 1))
@@ -65,7 +63,7 @@ def naive_smem_kernel(
     gC[bidy * BM + tidx, bidx * BN + tidy] = cute.Float16(acc)
 
 def main():
-    M, N, K = 1024, 1024, 1024
+    M, N, K = 16, 512, 128
 
     A = torch.randn((M, K), device="cuda", dtype=torch.float16)
     B = torch.randn((N, K), device="cuda", dtype=torch.float16)

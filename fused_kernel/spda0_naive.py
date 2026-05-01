@@ -30,6 +30,30 @@ def spda_explicit_ref(
     output = torch.matmul(score_sm, V) # (M, dv)
     return output
 
+def mha_explicit_ref(
+    X: torch.Tensor,    # (B, M, d_model)
+    Wqkv: torch.Tensor, # (d_model, 3*H*dk)
+    Wo: torch.Tensor,   # (H*dk, d_model)
+    H: int,
+) -> torch.Tensor:
+    B, M, d_model = X.shape
+    dk = d_model // H
+
+    QKV = X @ Wqkv                                   # (B, M, 3*H*dk)
+    Q, K, V = QKV.chunk(3, dim=-1)                   # 3x (B, M, H*dk)
+
+    Q = Q.view(B, M, H, dk).transpose(1, 2)          # (B, H, M, dk)
+    K = K.view(B, M, H, dk).transpose(1, 2)          # (B, H, M, dk)
+    V = V.view(B, M, H, dk).transpose(1, 2)          # (B, H, M, dk)
+
+    score = Q @ K.transpose(-2, -1) / (dk ** 0.5)    # (B, H, M, M)
+    score_sm = torch.softmax(score, dim=-1)           # (B, H, M, M)
+    attn = score_sm @ V                               # (B, H, M, dk)
+
+    attn = attn.transpose(1, 2).contiguous().view(B, M, H * dk)  # (B, M, H*dk)
+    output = attn @ Wo                                # (B, M, d_model)
+    return output
+
 def spda_with_kv_cache(
     Q_new: torch.Tensor,       # (1, dk)   — only the new query token
     K_new: torch.Tensor,       # (1, dk)   — new key to append

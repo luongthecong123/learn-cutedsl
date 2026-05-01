@@ -202,6 +202,10 @@ class Gemm_TC:
                 dst=tBsB[None, None, None]
             )
             
+            # Or simply use autovec copy
+            # cute.autovec_copy(tAgA[None, None, None, kidx], tAsA)            
+            # cute.autovec_copy(tBgB[None, None, None, kidx], tBsB)
+            
             cute.arch.sync_threads()
             
             # Load sA -> register A

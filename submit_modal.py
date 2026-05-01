@@ -14,6 +14,7 @@ image = (
     .uv_pip_install("torch", "nvidia-cutlass-dsl", "ninja", "apache-tvm-ffi", "torch-c-dlpack-ext")
     .add_local_dir(CURRENT_DIR / "cutedsl", remote_path="/root/cutedsl")
     .add_local_dir(CURRENT_DIR / "cuda", remote_path="/root/cuda")
+    .add_local_dir(CURRENT_DIR / "fused_kernel", remote_path="/root/fused_kernel")
 )
 
 app = modal.App("learn-cutedsl", image=image)
@@ -48,9 +49,11 @@ def run_kernel_sm90():
     # print("SM90 c1_wgmma_tma_load_store.py")
     # from cutedsl.c1_wgmma_tma_load_store import main
     # main()
-    print("SM90 c2_wgmma_tma_specialized_pipeline.py")
+    # print("SM90 c2_wgmma_tma_specialized_pipeline.py")
     from cutedsl.c2_wgmma_tma_specialized_pipeline import main
     main()
+
+
     
 
 @app.function(gpu="B200")
@@ -71,11 +74,24 @@ def run_kernel_sm100():
       
     
     
+@app.function(gpu="B200")
+def run_histogram_sm100():
+    import sys
+    sys.path.insert(0, "/root")
+    print("SM100 fused_kernel/histogram.py")
+    from fused_kernel.histogram import main
+    main()
+    print("SM100 fused_kernel/histogram_dsmem.py")
+    from fused_kernel.histogram_dsmem import main as main_dsmem
+    main_dsmem()
+
+
 @app.local_entrypoint()
 def main():
     # run_kernel_sm80.remote()
-    run_kernel_sm90.remote()
+    # run_kernel_sm90.remote()
     # run_kernel_sm100.remote()
     # run_kernel_sm120.remote()
+    run_histogram_sm100.remote()
     
     
