@@ -21,7 +21,7 @@ def gemm_kernel(gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor):
     
     bidx, bidy, bidz = cute.arch.block_idx()
     tidx, _, _ = cute.arch.thread_idx()
-    
+
     gA_batch = gA[bidz, None, None]  # (M, K)
     gB_batch = gB[bidz, None, None]  # (N, K)
     gC_batch = gC[bidz, None, None]  # (M, N)
@@ -65,6 +65,9 @@ def fake_wrapper(dtype, shape, stride_order, assumed_align):
     return cute.runtime.make_fake_compact_tensor(dtype=dtype, shape=shape, stride_order=stride_order, assumed_align=assumed_align)
 
 def main():
+    
+    #======================= TVM FFI =================================
+    
     BS = cute.sym_int()
     # K = cute.sym_int(divisibility=64)
     K = 1024
@@ -90,7 +93,7 @@ def main():
     tflops = (2 * BS * M * N * K) / (time * 1e6)
     print(f"DURATION: {time:>5.4f} µs | TFLOPS: {tflops:.4f}")
 
-    #===============================================================================
+    #======================= dlpack =================================
 
     BS, M, N, K = 8, 1024, 1024, 1024
 

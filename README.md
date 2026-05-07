@@ -1185,6 +1185,335 @@ Running [`c2_profile.py`](https://github.com/luongthecong123/learn-cutedsl/blob/
 
 </details>
 
+<details>
+<summary>8. Static Persistent Tile Scheduler, Cluster Launch Control, Dependant Kernel Launch, Grouped Tile Scheduler</summary>
+
+These are the techniques that manipulate thread block launches, they all share the same goal that is to reduce kernel launch overhead to reduce SM idle time.
+
+Normally, when we launch a grid of shape x, y, z, the block will be mapped to SM in a round robin manner. First, get the linear block idx = bidz * bdimx * bdimy + bidy * bdimx + bidx. For example on B200 with 148 SMs, the first block will be assigned to the first SM, second block -> second SM, wrapped around, 149-th block assigned to the first SM (first SM has 2 waves now),...
+
+With the below techniques, we can manipulate this hard coded pattern according to our liking.
+
+### 8.1. Static Persistent Tile Scheduler
+CuTeDSL provides a simple API to program persistent kernel with ease, although I found that this API introduces a meaningful overhead compared to manual persitent kernel design.
+
+A manual persistent kernel operates at the **CTA level**: the grid is launched with exactly `sm_count` blocks (one per SM), and each CTA strides through output tiles with a step equal to the total number of CTAs:
+
+```python
+# ── Host: launch exactly sm_count CTAs ──────────────────────────────────────
+sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+persistent_kernel(...).launch(grid=[sm_count, 1, 1], block=[BM * BN, 1, 1])
+
+# ── Device: each CTA strides through tiles with step = num_blocks ────────────
+bidx, _, _ = cute.arch.block_idx()
+gdimx, _, _ = cute.arch.grid_dim()      # = sm_count
+
+num_tiles_m = M // BM
+num_tiles_n = N // BN
+num_tiles   = num_tiles_m * num_tiles_n  # total output tiles
+
+for tile_idx in range(bidx, num_tiles, gdimx):   # stride = number of CTAs
+    tile_m = tile_idx % num_tiles_m
+    tile_n = tile_idx // num_tiles_m
+    # ... compute tile at (tile_m, tile_n) ...
+```
+
+With CuTeDSL API, we can do as follow:
+
+**Host side** — compute the tile grid and build the scheduler params, then derive the persistent grid shape:
+
+```python
+# persistent_naive_launcher (host)
+c_tile_shape = (BM, BN)
+gC = cute.zipped_divide(mC, tiler=c_tile_shape)
+num_ctas_mnl = (*gC[(0, (None, None))].shape, 1)  # (tiles_m, tiles_n, 1)
+
+cluster_shape_mnl = (1, 1, 1)
+
+tile_sched_params = utils.PersistentTileSchedulerParams(
+    num_ctas_mnl,
+    cluster_shape_mnl,
+    swizzle_size=1,
+    raster_along_m=True,
+)
+
+# Grid is capped at max_active_clusters * ctas_per_cluster instead of the full tile count
+grid = utils.StaticPersistentTileScheduler.get_grid_shape(
+    tile_sched_params, max_active_clusters
+)
+
+persistent_naive_kernel(mA, mB, mC, tile_sched_params).launch(
+    grid=grid,
+    block=[256, 1, 1],
+)
+```
+
+`max_active_clusters` is typically `sm_count // ctas_per_cluster` — the number of CTAs that fit on the device simultaneously. The scheduler caps the grid to that size so each persistent CTA processes multiple output tiles in a loop.
+
+**Device side** — create the scheduler, iterate over assigned tiles, and advance after each one:
+
+```python
+# persistent_naive_kernel (device)
+tile_sched = utils.StaticPersistentTileScheduler.create(
+    tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+)
+work_tile = tile_sched.initial_work_tile_info()
+
+while work_tile.is_valid_tile:
+    tile_m = work_tile.tile_idx[0]
+    tile_n = work_tile.tile_idx[1]
+
+    coord = (tile_m, tile_n, None)
+    # ... compute the tile at (tile_m, tile_n) ...
+
+    tile_sched.advance_to_next_work()
+    work_tile = tile_sched.get_current_work()
+```
+
+`initial_work_tile_info()` returns the first tile assigned to this CTA. `advance_to_next_work()` strides by the grid size to the next unprocessed tile, and `get_current_work()` fetches the updated `work_tile`. The loop exits when `is_valid_tile` is `False`, meaning all tiles have been claimed. See [`a1_naive_cute_persistent_kernel.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute_persistent_kernel.py) for the full working example.
+
+
+### 8.2. Cluster Launch Control
+
+The static persistent scheduler described above has one blind spot: it divides tiles evenly among the available SMs at launch time. If some SMs are busy running another kernel concurrently, those tiles pile up in a queue and the rest of the GPU sits idle — workload imbalance.
+
+Blackwell (SM100) introduces **Cluster Launch Control (CLC)**, a hardware work-stealing mechanism that solves this at the PTX level. The key difference from static persistent scheduling is:
+
+- **Static persistent**: grid is capped to `max_active_clusters`; each CTA strides through its pre-assigned slice of tiles.
+- **CLC dynamic**: the grid is launched at **full size** (one CTA per output tile, just like a non-persistent kernel). Each CTA starts on its own `blockIdx` tile, then queries the hardware (`clusterlaunchcontrol.try_cancel`) to steal a not-yet-started tile from the pending queue. An SM that finishes its tile early immediately absorbs work from overloaded SMs rather than going idle.
+
+Every `ClcID` (a 3-D grid coordinate) is guaranteed to be processed exactly once, either by the CTA it was originally assigned to, or by a thief.
+
+**SMEM requirements.** CLC needs two extra shared-memory buffers:
+- `smem_mbar` (8 B) — an `mbarrier` that the scheduler warp uses to signal when the CLC response has arrived.
+- `smem_clc_rsp` (16 B) — where the hardware writes the 16-byte CLC response containing the stolen `ClcID`.
+
+**Host side** — build `ClcDynamicPersistentTileSchedulerParams` with the full problem tile shape and cluster shape, then derive the grid (full size, not capped):
+
+```python
+# num_tiles = (T, num_heads, num_splits) — one CTA per tile
+clc_params = utils.ClcDynamicPersistentTileSchedulerParams(
+    (T, num_heads, num_splits_c),
+    (1, 1, 1),             # cluster shape
+)
+grid = utils.ClcDynamicPersistentTileScheduler.get_grid_shape(clc_params)
+
+my_kernel(
+    ..., clc_params,
+).launch(grid=list(grid), block=[BLOCK_SIZE, 1, 1])
+```
+
+**Device side** — allocate the two CLC SMEM buffers, init the mbarrier once, then follow the same `initial_work_tile_info` → loop → `advance_to_next_work` → `get_current_work` pattern, but with a phase-aware mbarrier wait replacing the static stride:
+
+```python
+# SMEM buffers required by CLC
+smem_mbar    = allocator.allocate_tensor(cutlass.Int64,
+    cute.make_layout((1,), stride=(1,)), 8, None)   # 8 B mbarrier
+smem_clc_rsp = allocator.allocate_tensor(cutlass.Int32,
+    cute.make_layout((4,), stride=(1,)), 16, None)  # 16 B CLC response
+
+# One-time mbarrier init
+if tidx == 0:
+    cute.arch.mbarrier_init(smem_mbar.iterator, 1)
+cute.arch.sync_threads()
+
+# Create CLC scheduler (needs the CLC response SMEM pointer)
+scheduler = utils.ClcDynamicPersistentTileScheduler.create(
+    clc_params,
+    cute.arch.block_idx(),
+    cute.arch.grid_dim(),
+    smem_clc_rsp.iterator,      # extra vs. static scheduler
+)
+
+phase = cutlass.Int32(0)
+work_tile = scheduler.initial_work_tile_info()   # first tile = blockIdx
+
+while work_tile.is_valid_tile:
+    tile_m = work_tile.tile_idx[0]
+    tile_n = work_tile.tile_idx[1]
+
+    # ... compute the tile at (tile_m, tile_n) ...
+
+    # ── Issue CLC query for the NEXT tile, wait, fetch ───────────────────────
+    # advance_to_next_work uses elect_one (warp-level), so it must be called from warp 0 only
+    cute.arch.sync_threads()
+    if warp_idx == 0:
+        if tidx == 0:
+            cute.arch.mbarrier_arrive_and_expect_tx(smem_mbar.iterator, 16)
+        scheduler.advance_to_next_work(smem_mbar.iterator)
+
+    cute.arch.mbarrier_wait(smem_mbar.iterator, phase)
+    phase = phase ^ cutlass.Int32(1)
+    work_tile = scheduler.get_current_work()
+```
+
+The full working example is in [`a1_naive_cute_clc.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute_clc.py)  that runs the same naive `MmaUniversalOp` GEMM on Blackwell SM100.
+
+### 8.3. Dependant Kernel Launch
+
+**Programmatic Dependent Launch (PDL)** lets a second kernel start on idle SMs before the first kernel has finished — its CTAs spin in a lightweight hardware wait until the producer signals readiness, then proceed without a full host-side synchronization. The key constraint is that any work the consumer does before the wait must not read data written by the producer.
+
+**Host side** — pass `use_pdl=True` to both `.launch()` calls on the same stream. CUDA schedules the consumer grid immediately; its CTAs block at the first `griddepcontrol_wait()` they hit:
+
+```python
+self.compute_kernel(...).launch(
+    grid=[self.num_heads, self.num_splits, 1],
+    block=[self.compute_threads, 1, 1],
+    stream=stream,
+    use_pdl=True,   # producer: signals when safe
+)
+
+self.reduce_kernel(...).launch(
+    grid=[self.t_max, self.num_heads, 1],
+    block=[self.reduce_threads, 1, 1],
+    stream=stream,
+    use_pdl=True,   # consumer: waits for producer signal
+)
+```
+
+**Producer kernel** — call `griddepcontrol_launch_dependents()` as soon as all data that the consumer will read has been written to global memory. Everything after this call is the producer's epilogue (writing its own outputs) and can overlap with the consumer's prologue:
+
+```python
+# ── PDL: signal dependents after prologue (SMEM assign + cp.async bulk load)
+if group_idx == 0:
+    cute.arch.griddepcontrol_launch_dependents()
+
+# rest of compute (score, output accumulation) — overlaps with reduce prologue
+```
+
+**Consumer kernel** — do all setup that is independent of the producer's outputs (SMEM allocation, counting valid indices from the same input tensors), then stall:
+
+```python
+# prologue: independent work (count num_valid from sparse_indices)
+num_valid = ...
+
+# ── PDL: stall until compute kernel signals
+cute.arch.griddepcontrol_wait()
+
+# now safe to read partial_out / partial_lse written by compute kernel
+```
+
+The full example is in [`fused_kernel/dsa_attn.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/fused_kernel/dsa_attn.py) — `compute_kernel` signals after its group-0 prologue (sparse index load + cp.async), so the `reduce_kernel` can start counting valid splits while compute finishes the actual attention scores.
+
+### 8.4. Grouped Tile Scheduler
+
+A **grouped GEMM** fuses a batch of independent GEMMs with potentially different (M, N, K) shapes into a single kernel launch. `utils.StaticPersistentGroupTileScheduler` extends the static persistent scheduler by flattening all group tiles into the z-dimension and doing a warp-wide prefix-sum search (`delinearize_z`) to map each linear tile index back to a `(group_idx, tile_m, tile_n)` coordinate.
+
+**Host side** — pack per-group shapes into a `(group_count, 4)` Int32 tensor, compute the total tile count across all groups, and build `PersistentTileSchedulerParams` the same way as section 8.1:
+
+```python
+GROUP_COUNT = 4
+M, N, K = 256, 256, 256
+
+# [M, N, K, 1] row per group — can differ between groups
+problem_shape_mnkl = torch.tensor(
+    [[M, N, K, 1]] * GROUP_COUNT, device="cuda", dtype=torch.int32
+)
+
+total_tiles = GROUP_COUNT * math.ceil(M / BM) * math.ceil(N / BN)
+tile_sched_params = utils.PersistentTileSchedulerParams(
+    num_ctas_mnl=(1, 1, total_tiles),
+    cluster_shape_mnl=(1, 1, 1),
+    swizzle_size=1,
+    raster_along_m=True,
+)
+grid = utils.StaticPersistentTileScheduler.get_grid_shape(
+    tile_sched_params, max_active_clusters
+)
+```
+
+**Device side** — `get_current_work()` returns a `GroupedWorkTileInfo`; read `group_search_result` for per-group coordinates:
+
+```python
+scheduler = utils.StaticPersistentGroupTileScheduler.create(
+    tile_sched_params,
+    cute.arch.block_idx(),
+    cute.arch.grid_dim(),
+    cluster_tile_shape_mnk=(BM, BN, BK),
+    initial_search_state=utils.create_initial_search_state(),
+    group_count=group_count,                # cutlass.Constexpr
+    problem_shape_mnkl=problem_shape_mnkl,  # cute.Tensor (group_count, 4)
+)
+
+work_tile = scheduler.get_current_work()
+while work_tile.is_valid_tile:
+    r = work_tile.group_search_result
+    # r.group_idx, r.cta_tile_idx_m, r.cta_tile_idx_n, r.cta_tile_count_k
+
+    # ... compute the (r.cta_tile_idx_m, r.cta_tile_idx_n) tile of r.group_idx ...
+
+    scheduler.advance_to_next_work()
+    work_tile = scheduler.get_current_work()
+```
+
+The full working example is in [`a1_naive_cute_grouped_scheduler.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute_grouped_scheduler.py) — 4 groups of 256×256×256 FP32 naive GEMM on B200.
+
+</details>
+
+<details>
+<summary>9. Distributed Shared Memory (DSMEM)</summary>
+
+Blocks within the same cluster can communicate through DSMEM, where it uses the bandwidth of L1.5 cache. CuTeDSL exposes DSMEM through two primitives:
+
+- `cute.arch.mapa(smem_ptr, peer_cta_rank)` — remap a local SMEM pointer into the corresponding SMEM offset on a peer CTA in the same cluster. Returns a `!llvm.ptr<3>` that can be loaded/stored/atomically updated like any SMEM pointer.
+- `cute.arch.cluster_arrive()` / `cute.arch.cluster_wait()` — cluster-wide barrier; used to ensure all peer CTAs have finished writing before anyone reads.
+
+For atomic reductions across the cluster, lower directly to NVVM:
+
+```python
+from cutlass._mlir.dialects import nvvm
+
+nvvm.red(
+    op=nvvm.ReductionOp.ADD,
+    type_=nvvm.ReductionType.S32,
+    a=mapped_ptr_ir,           # from cute.arch.mapa(...).llvm_ptr
+    b=val.ir_value(),
+    mem_order=nvvm.MemOrderKind.RELAXED,
+    shared_space=nvvm.SharedSpace.shared_cluster,
+    mem_scope=nvvm.MemScopeKind.CLUSTER,
+)
+# → PTX `red.relaxed.cluster.shared::cluster.add.s32 [ptr], val`
+```
+
+**Three-level reduction example.** A canonical use case is a vector reduction that goes warp → block → grid. The grid-level step uses DSMEM to atomically add each CTA's partial sum into CTA 0's SMEM accumulator inside a single cluster:
+
+```python
+# Allocate smem warp_patials to store warp reduction results
+
+# Level 1: thread-strided sum + warp shuffle butterfly
+warp_sum = warp_reduce_sum(thread_sum, width=32)
+if lane == 0: warp_partials[warp] = warp_sum
+cute.arch.sync_threads()
+
+# Level 2: warp 0 reduces NUM_WARPS partials on smem
+if warp == 0:
+    v = warp_partials[lane] if lane < NUM_WARPS else 0
+    cta_sum = warp_reduce_sum(v, width=32)
+
+    # Level 3: each CTA's thread 0 atomic-adds into CTA 0's accumulator over DSMEM
+    if lane == 0:
+        dst = cute.arch.mapa(cluster_acc.iterator, cutlass.Int32(0))
+        red_shared_cluster_add_i32(dst, cta_sum)
+
+# Cluster barrier — peer atomics must land before CTA 0 reads
+cute.arch.cluster_arrive()
+cute.arch.cluster_wait()
+
+rank = cute.arch.block_in_cluster_idx()[0]
+if rank == 0 and tid == 0:
+    out[0] = cluster_acc[0]
+```
+
+A couple of subtleties worth calling out:
+
+- The DSMEM-target buffer (`cluster_acc` here) must be allocated in **every** CTA. `mapa` only remaps offsets — it does not allocate — so the SMEM layout has to match across the cluster.
+- The grid shape and the cluster shape must agree: launch with `grid=[CLUSTER_SIZE,1,1]`, `cluster=[CLUSTER_SIZE,1,1]` to keep the whole reduction inside one cluster. For larger inputs, run multiple clusters and finish with a global atomic.
+- `nvvm.red` is fire-and-forget; PTX 8.1+ also offers `red.async ... mbarrier::complete_tx` if you want to overlap the DSMEM atomic with independent work.
+
+The full working example is in [`a0_vector_reduction_dsmem.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a0_vector_reduction_dsmem.py) — sums 1M Int32 values on B200.
+
+</details>
+
 ---
 TFLOPS progression (M=N=K=4096, dtype=float16):
 Note that the CUDA C++ uses dynamic shape while the CuTeDSL uses static shape. Check section 2.2.3 for more details.
@@ -1253,3 +1582,4 @@ modal run submit_modal.py
 9. https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/overview.html
 10. https://research.colfax-intl.com/cutlass-tutorial-writing-gemm-kernels-using-tensor-memory-for-nvidia-blackwell-gpus/
 11. https://newsletter.semianalysis.com/p/nvidia-tensor-core-evolution-from-volta-to-blackwell
+12. https://github.com/Dao-AILab/quack/blob/main/media/2025-07-10-membound-sol.md

@@ -67,10 +67,23 @@ def run_kernel_sm100():
     # print("SM100 d2_tcgen05_tma_specialized_pipeline.py")
     # from cutedsl.d2_tcgen05_tma_umma_specialized_pipeline import main
     # main()
-    
-    print("SM100 d3_tcgen05_tma_umma_2cta_specialized_pipeline.py")
-    from cutedsl.d3_tcgen05_tma_umma_2cta_specialized_pipeline import main
+    # print("SM100 d3_tcgen05_tma_umma_2cta_specialized_pipeline.py")
+    # from cutedsl.d3_tcgen05_tma_umma_2cta_specialized_pipeline import main
+    # main()
+
+    print("SM100 a1_naive_cute_clc.py")
+    import sys
+    sys.path.insert(0, "/root")
+    from cutedsl.a1_naive_cute_clc import main
     main()
+
+    print("SM100 a1_naive_cute_grouped_scheduler.py")
+    from cutedsl.a1_naive_cute_grouped_scheduler import main as main_grouped
+    main_grouped()
+
+    print("SM100 a0_vector_reduction_dsmem.py")
+    from cutedsl.a0_vector_reduction_dsmem import main as main_dsmem
+    main_dsmem()
       
     
     
@@ -90,8 +103,8 @@ def run_histogram_sm100():
 def main():
     # run_kernel_sm80.remote()
     # run_kernel_sm90.remote()
-    # run_kernel_sm100.remote()
+    run_kernel_sm100.remote()
     # run_kernel_sm120.remote()
-    run_histogram_sm100.remote()
+    # run_histogram_sm100.remote()
     
     
