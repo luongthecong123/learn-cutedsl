@@ -17,9 +17,8 @@ The whole point is to overlap score computation and softmax + output computation
 """
 import cutlass
 import cutlass.cute as cute
-import cutlass.cute.nvgpu.cpasync as cpasync
-from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 import cutlass.utils as utils
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.cute.nvgpu import tcgen05, cpasync
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op, T as MLIR_T
@@ -1008,60 +1007,6 @@ def compile_kernel():
 
 
 _hybrid, _compiled = compile_kernel()
-
-
-def run_single(workload_idx: int) -> str:
-    import os, json as _json
-    from pathlib import Path
-    from safetensors.torch import load_file
-    from src.utils import WORKLOAD_INFO, make_tensors
-
-    H, D_ckv = NUM_HEADS, HEAD_DIM_CKV
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
-
-    CONTEST = Path(os.environ.get("CONTEST_DIR", "/data"))
-    JSONL   = CONTEST / "workloads" / "dsa_paged" / "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64.jsonl"
-    workloads = [_json.loads(l) for l in open(JSONL)]
-    w   = workloads[workload_idx]
-    ax  = w["workload"]["axes"]
-    inp = w["workload"]["inputs"]
-    T, P = ax["num_tokens"], ax["num_pages"]
-    _uuid, _T, max_valid = WORKLOAD_INFO[workload_idx]
-
-    Bc = (NUM_HEADS // HEADS_PER_SPLIT) * NUM_SPLITS
-    Br = T * NUM_HEADS
-    print(f"\nWorkload {workload_idx + 1}: MaxValid={max_valid}  T={T}  "
-          f"ComputeBlocks={Bc}  ReduceBlocks={Br}")
-
-    q_nope, q_pe, ckv, kpe, _ = make_tensors(T, P)
-    sf = load_file(str(CONTEST / inp["sparse_indices"]["path"]))
-    si = sf[inp["sparse_indices"]["tensor_key"]].cuda()
-
-    output_t = torch.zeros(T, H, D_ckv, dtype=torch.bfloat16, device="cuda")
-    lse_t    = torch.full((T, H), -float("inf"), dtype=torch.float32, device="cuda")
-    probe_prod   = torch.zeros((Bc, PROBE_COLS_PROD),   dtype=torch.int64, device="cuda")
-    probe_cons   = torch.zeros((Bc, PROBE_COLS_CONS),   dtype=torch.int64, device="cuda")
-    probe_sgemm  = torch.zeros((Bc, PROBE_COLS_SGEMM),  dtype=torch.int64, device="cuda")
-    probe_reduce = torch.zeros((LIMIT_REQUEST * NUM_HEADS, PROBE_COLS_REDUCE), dtype=torch.int64, device="cuda")
-
-    for _ in range(3):
-        output_t.zero_(); lse_t.fill_(-float("inf"))
-        probe_prod.zero_(); probe_cons.zero_(); probe_sgemm.zero_(); probe_reduce.zero_()
-        _compiled(q_nope, q_pe, ckv, kpe, si,
-                  _hybrid.partial_out, _hybrid.partial_lse,
-                  output_t, lse_t, probe_prod, probe_cons, probe_sgemm, probe_reduce)
-        torch.cuda.synchronize()
-
-    probe_prod.zero_(); probe_cons.zero_(); probe_sgemm.zero_(); probe_reduce.zero_()
-    output_t.zero_(); lse_t.fill_(-float("inf"))
-    _compiled(q_nope, q_pe, ckv, kpe, si,
-              _hybrid.partial_out, _hybrid.partial_lse,
-              output_t, lse_t, probe_prod, probe_cons, probe_sgemm, probe_reduce)
-    torch.cuda.synchronize()
-
-    ep, bp, ec, bc, es, bs = dump_compute(probe_prod, probe_cons, probe_sgemm, Bc, NUM_SPLITS)
-    er, br = dump_reduce(probe_reduce, Br)
-    return build_combined_trace(ep, bp, ec, bc, es, bs, er, br)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

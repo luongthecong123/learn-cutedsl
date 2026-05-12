@@ -84,19 +84,6 @@ def run_kernel_sm100():
     print("SM100 a0_vector_reduction_dsmem.py")
     from cutedsl.a0_vector_reduction_dsmem import main as main_dsmem
     main_dsmem()
-      
-    
-    
-@app.function(gpu="B200")
-def run_histogram_sm100():
-    import sys
-    sys.path.insert(0, "/root")
-    print("SM100 fused_kernel/histogram.py")
-    from fused_kernel.histogram import main
-    main()
-    print("SM100 fused_kernel/histogram_dsmem.py")
-    from fused_kernel.histogram_dsmem import main as main_dsmem
-    main_dsmem()
 
 
 @app.local_entrypoint()

@@ -346,10 +346,6 @@ class Indexer_kvsplit_v4_hist_pdl:
 
         q_i32_base_full = cute.recast_ptr(q_index_fp8.iterator, dtype=cutlass.Int32)
         k_i32_base_full = cute.recast_ptr(k_index_cache_fp8.iterator, dtype=cutlass.Int32)
-        # ── PDL: all independent setup (SMEM alloc, copy atoms, base ptrs)
-        #         is done.  Signal now so dependent topk CTAs can schedule on
-        #         SMs and run their independent prologue (SMEM alloc + τ-init)
-        #         in parallel with this kernel's main MMA work.
         
         # ── Pass-through path ──────────────────────────────────────────
         if bidx >= num_splits:
@@ -596,13 +592,7 @@ class Indexer_kvsplit_v4_hist_pdl:
                 smem_tau[2] = cutlass.Int32(0)          # above_total
                 smem_tau[3] = cutlass.Int32(top_k_len)  # k_to_find
                 smem_tau[4] = cutlass.Int32(0)          # early_exit
-
-            # ── PDL: consumer prologue done (SMEM alloc + τ-state init).
-            #         Wait for producer to finish writing score_output before
-            #         the setup/phase-1 loops that read it.  sync_threads
-            #         after wait ensures all threads see consistent memory.
             
-
             # ── Setup: cache float→radix bits in SMEM (when sl fits) ──
             if cutlass.const_expr(USE_LIMIT_TOPK_SEQ_LEN):
                 setup_base = tidx * cutlass.Int32(NUM_VEC)

@@ -2,6 +2,8 @@
 
  CuTeDSL provides quality of life APIs while making sure you have access to the low level hardware to write performant kernels. Here, you can find kernels for Ampere SM80, Hopper SM90, Blackwell SM100 (B200) and Blackwell SM120 (RTX Pro 6000 Blackwell, RTX 5090, 50s series). Beyond the kernels, the repo also serves as a reference for commonly used CuTeDSL APIs. Each concept is isolated and explained with minimal surrounding noise, making it easy to lift a pattern into your own code or feed it as context to an LLM. 
 
+In fused_kernel, you can find my solution to FlashInfer AI Kernel Generation Contest @ MLSys 2026 with modal run scripts and explanation.
+
 ## Frequently used APIs explanation 
 *Click ▸ to expand each section*
 
