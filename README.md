@@ -1,8 +1,8 @@
 # Learn CuTeDSL
 
- CuTeDSL provides quality of life APIs while making sure you have access to the low level hardware to write performant kernels. Here, you can find kernels for Ampere SM80, Hopper SM90, Blackwell SM100 (B200) and Blackwell SM120 (RTX Pro 6000 Blackwell, RTX 5090, 50s series). Beyond the kernels, the repo also serves as a reference for commonly used CuTeDSL APIs. Each concept is isolated and explained with minimal surrounding noise, making it easy to lift a pattern into your own code or feed it as context to an LLM. 
+ CuTeDSL provides quality of life APIs while making sure you have access to the low level hardware to write performant kernels. Here, you can find kernels for Ampere SM80, Hopper SM90, Blackwell SM100 (B200) and Blackwell SM120 (RTX Pro 6000 Blackwell, RTX 5090, 50s series). Beyond the kernels, the repo also serves as a reference for commonly used CuTeDSL APIs. Each concept is isolated and explained with minimal surrounding noise, making it easier to lift a pattern into your own code or feed it as context to an LLM. 
 
-In fused_kernel, you can find my solution to FlashInfer AI Kernel Generation Contest @ MLSys 2026 with modal run scripts and explanation.
+In `fused_kernel` dir, you can find my Agent-assisted solution to FlashInfer AI Kernel Generation Contest @ MLSys 2026 with modal run scripts and explanation. This solution got rank # 2 on Deepseek Sparse Attention [1] (DSA) track, with a 29.5x speedup over Flashinfer wrapper of DeepGEMM and TensorRT_LLM.
 
 ## Frequently used APIs explanation 
 *Click ▸ to expand each section*
@@ -103,7 +103,7 @@ CuTeDSL handles the bridge via MLIR/NVVM — no `pybind11` bindings, no `.cu`/`.
 
 #### 2.2.3. CuTeDSL compilation and Dump PTX and CUBIN
 
-CuTeDSL offers two compilation paths — **default (DLPack)** and **TVM FFI** — each suited to different workflows.
+CuTeDSL offers two compilation paths — **default (DLPack)** and **TVM FFI** — each suited for different workflows.
 
 **Default compilation** wraps live PyTorch tensors via `from_dlpack`, which shares the GPU pointer with CuTeDSL without copying data. The shape, stride, and alignment information are read directly from the tensor:
 
@@ -117,7 +117,7 @@ C_ = from_dlpack(C, assumed_align=16)
 compiled = cute.compile(cute_naive, A_, B_, C_)
 compiled(A_, B_, C_)
 ```
-*Used in [`a1_naive_cute.py` main()](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute.py#L75). This compiles a kernel specialized to the exact shapes and strides of the provided tensors.*
+Used in [`a1_naive_cute.py` main()](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute.py#L75). This compiles a kernel specialized to the exact shapes and strides of the provided tensors, meaning passing shapes that are different then the ones the kernel was compiled with will make the kernel compute to the wrong answer.
 
 **TVM FFI compilation** uses fake tensors — lightweight placeholders that carry shape, dtype, stride order, and alignment metadata but hold no actual data. This lets you compile a kernel once without allocating GPU memory, and call the resulting function with any tensor that satisfies the declared constraints. The compiled TVM FFI function accepts `torch.Tensor` objects directly (no `from_dlpack` wrapping needed at call time), providing a faster eager invocation path:
 
@@ -139,7 +139,7 @@ compiled(A, B, C)
 ```
 *Used in [`a1_naive_cute_tvm_ffi_fake_tensors.py`](https://github.com/luongthecong123/learn-cutedsl/blob/main/cutedsl/a1_naive_cute_tvm_ffi_fake_tensors.py).*
 
-**Static vs. dynamic shapes.** Dimensions passed as Python `int` (e.g. `M = 1024`) are baked into the generated kernel as compile-time constants, enabling aggressive optimizations like loop unrolling. Dimensions declared with `cute.sym_int()` remain dynamic — the kernel accepts any value at runtime. You can also attach divisibility constraints (`cute.sym_int(divisibility=16)`) so the compiler can still generate aligned loads and unroll by that factor. A common pattern is to keep batch size dynamic while fixing the problem dimensions (M, N, K) statically.
+**Static vs. dynamic shapes.** Dimensions passed as Python `int` (e.g. `M = 1024`) are baked into the generated kernel as compile-time constants, enabling aggressive optimizations like loop unrolling. Dimensions declared with `cute.sym_int()` remain dynamic — the kernel accepts any value at runtime. You can also attach divisibility constraints (`cute.sym_int(divisibility=16)`) so the compiler can still generate aligned loads and unroll by that factor.
 
 With `from_dlpack`, you can achieve a similar effect using `mark_compact_shape_dynamic`:
 
